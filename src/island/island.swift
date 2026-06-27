@@ -20,6 +20,7 @@ let kSessionsDir = kEventDir + "/sessions"     // one <tabUUID>.json per live se
 let kProjectOrderFile = kEventDir + "/project-order"   // persisted dropdown group order (first-seen)
 let kGifPath = kEventDir + "/claude.gif"               // working
 let kThinkingGifPath = kEventDir + "/claude-thinking.gif"  // thinking
+let kCompactingGifPath = kEventDir + "/claude-compacting.gif"  // compacting
 let kDoneImagePath = kEventDir + "/claude-done.tiff"       // success
 let kDarwinName = "com.claude-island.event"
 
@@ -126,7 +127,7 @@ func cardWidth(_ card: SessionCard, idx: Int) -> CGFloat {
 // MARK: - State
 
 final class IslandState: ObservableObject {
-    enum Mode: String { case thinking, working, attention, error, done }
+    enum Mode: String { case thinking, working, attention, error, done, compacting, compacted }
 
     @Published var mode: Mode = .thinking
     @Published var title: String = "Claude Code"
@@ -351,6 +352,8 @@ struct IslandView: View {
 
     private static let red = Color(red: 0.898, green: 0.282, blue: 0.302) // #E5484D
 
+    private static let compact = Color(red: 142 / 255, green: 165 / 255, blue: 255 / 255) // #8EA5FF
+
     private var accent: Color {
         switch state.mode {
         case .thinking:  return IslandView.amber
@@ -358,6 +361,7 @@ struct IslandView: View {
         case .attention: return IslandView.coral
         case .error:     return IslandView.red
         case .done:      return IslandView.green
+        case .compacting, .compacted: return IslandView.compact
         }
     }
 
@@ -424,6 +428,7 @@ struct IslandView: View {
         case "working":           return IslandView.coral
         case "attention", "error": return IslandView.red
         case "done":              return IslandView.green
+        case "compacting", "compacted": return IslandView.compact
         case "stale":             return Color(white: 0.5)   // done, unattended >15 min
         default:                  return Color(white: 0.55)
         }
@@ -707,6 +712,7 @@ struct IslandView: View {
         case .thinking: return IslandView.amber
         case .done:     return IslandView.green
         case .error:    return IslandView.red
+        case .compacting, .compacted: return IslandView.compact
         default:        return IslandView.coral
         }
     }
@@ -728,6 +734,7 @@ struct IslandView: View {
         // verb — so suppress it here to avoid showing the same text on both sides.
         case .working:                   return state.detail.isEmpty ? "" : clip(state.preview)
         case .done, .attention, .error:  return clip(state.preview)
+        case .compacting, .compacted:    return ""
         }
     }
 
@@ -789,6 +796,8 @@ struct IslandView: View {
     private var primary: String {
         switch state.mode {
         case .error: return "Error"
+        case .compacting: return "Compacting…"
+        case .compacted:  return "Compacted"
         case .done:  return state.elapsed.isEmpty ? "Finished" : "Finished " + state.elapsed
         // working: verb; thinking: "Thinking…"; attention: label. A malformed/partial
         // working event can carry a preview but no verb — fall back to the preview so the
@@ -817,6 +826,10 @@ struct IslandView: View {
         case .error:
             Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 12, weight: .semibold)).foregroundColor(accent).frame(width: 16)
         case .done:
+            Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundColor(accent).frame(width: 18)
+        case .compacting:
+            icon(kCompactingGifPath, fallback: AnyView(Circle().fill(accent).frame(width: 9, height: 9).frame(width: 18)))
+        case .compacted:
             Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundColor(accent).frame(width: 18)
         }
     }
@@ -1430,7 +1443,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         case .done:
             Ticker.shared.stop()
             state.elapsed = formatElapsed(f)        // frozen total
-        case .attention, .error:  Ticker.shared.stop()
+        case .attention, .error, .compacting, .compacted: Ticker.shared.stop()
         }
         // The 1s clock runs while ANY visible session is mid-turn, so every active row's
         // timer in the dropdown ticks live — not just the front pill's.

@@ -12,6 +12,7 @@ const MACOS_DIR = path.join(APP_PATH, "Contents", "MacOS");
 const ISLAND_SRC = path.join(__dirname, "..", "src", "island", "island.swift");
 const SEND_SRC = path.join(__dirname, "..", "src", "island", "island-send.swift");
 const HOOK_SRC = path.join(__dirname, "..", "src", "island", "island-hook.sh");
+const ASSETS_DIR = path.join(__dirname, "..", "src", "island", "assets");
 const SETTINGS_PATH = path.join(HOME, ".claude", "settings.json");
 const LAUNCH_AGENTS = path.join(HOME, "Library", "LaunchAgents");
 const PLIST_LABEL = "com.claude-island.app";
@@ -152,6 +153,14 @@ async function install() {
 
   fs.mkdirSync(LAUNCH_AGENTS, { recursive: true });
   fs.mkdirSync(EVENT_DIR, { recursive: true });
+
+  // Copy the animated icons into the (TCC-safe) event dir the daemon reads from.
+  try {
+    for (const gif of fs.readdirSync(ASSETS_DIR).filter((f) => f.endsWith(".gif"))) {
+      fs.copyFileSync(path.join(ASSETS_DIR, gif), path.join(EVENT_DIR, gif));
+    }
+    done("Copied icons");
+  } catch {}
   const agentPlist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -244,6 +253,9 @@ function configureHooks(hookDest) {
   settings.hooks.PostToolUse = [...strip(settings.hooks.PostToolUse), hook("post")];
   settings.hooks.Notification = [...strip(settings.hooks.Notification), hook("attention")];
   settings.hooks.Stop = [...strip(settings.hooks.Stop), hook("stop")];
+  // PreCompact → "Compacting…"; SessionStart (source=compact) → "Compacted".
+  settings.hooks.PreCompact = [...strip(settings.hooks.PreCompact), hook("compact")];
+  settings.hooks.SessionStart = [...strip(settings.hooks.SessionStart), hook("sessionstart")];
 
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
 }
@@ -284,7 +296,7 @@ function uninstall() {
   if (fs.existsSync(SETTINGS_PATH)) {
     const settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
     let removed = false;
-    for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop"]) {
+    for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "PreCompact", "SessionStart"]) {
       if (settings.hooks?.[event]) {
         settings.hooks[event] = settings.hooks[event].filter(
           (n) => !n.hooks?.some((h) => MINE.test(h.command || ""))

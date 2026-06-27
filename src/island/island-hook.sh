@@ -277,6 +277,18 @@ except: print('')
         MSG=$(echo "$INPUT" | python3 -c "import sys,json;print(json.load(sys.stdin).get('last_assistant_message','') or '')" 2>/dev/null)
         emit done "" "$MSG"
         ;;
+    compact)
+        # PreCompact: the transcript is about to be compacted (manual /compact or auto when
+        # the context fills). Show the periwinkle "Compacting…" state until it completes.
+        emit compacting "Compacting…" ""
+        ;;
+    sessionstart)
+        # SessionStart fires for startup/resume/clear/compact. Only the compact source means
+        # a compaction just finished — flip to the "Compacted" success state. Ignore the rest
+        # so a fresh launch/resume never clobbers the live state.
+        SRC=$(echo "$INPUT" | python3 -c "import sys,json;print(json.load(sys.stdin).get('source','') or '')" 2>/dev/null)
+        if [ "$SRC" = "compact" ]; then emit compacted "Compacted" ""; fi
+        ;;
     *)
         exit 0
         ;;

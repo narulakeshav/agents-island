@@ -173,8 +173,12 @@ case "$EVENT" in
         emit thinking "Thinking…" ""
         ;;
     tool)
-        # Show Claude's text if its latest block is text, else the tool action.
-        PREVIEW=$(echo "$INPUT" | python3 -c "
+        # Left = the real verb for what's running (Reading/Editing/…); right = the concrete
+        # object (file / command / pattern), or Claude's latest text if its last block is text.
+        # The daemon's live poll keeps this fresh between events, but emitting the real verb
+        # here (not a random gerund) means there's no cosmetic flash before the poll catches up.
+        # python prints "VERB<TAB>PREVIEW".
+        OUT=$(echo "$INPUT" | python3 -c "
 import sys, json, os
 d = json.load(sys.stdin)
 tx = d.get('transcript_path','')
@@ -193,7 +197,7 @@ try:
             break
 except: pass
 if last_kind=='text' and last_text.strip():
-    print(last_text.strip().split(chr(10))[0][:60])
+    print('Responding\t'+last_text.strip().split(chr(10))[0][:60])
 else:
     tool=d.get('tool_name',''); ti=d.get('tool_input',{}) or {}
     base=lambda p: os.path.basename(p) if p else ''
@@ -206,9 +210,12 @@ else:
     label={'Edit':'Editing','MultiEdit':'Editing','Write':'Writing','Read':'Reading',
            'NotebookEdit':'Editing','Bash':'Running','Grep':'Searching','Glob':'Finding',
            'Task':'Delegating','WebFetch':'Fetching','WebSearch':'Searching','TodoWrite':'Planning'}.get(tool,tool)
-    print((label+' '+tgt).strip())
+    print((label or 'Working')+'\t'+tgt)
 " 2>/dev/null)
-        emit working "$(pick)…" "$PREVIEW"
+        VERB=""; PREVIEW=""
+        IFS=$'\t' read -r VERB PREVIEW <<< "$OUT"
+        [ -z "$VERB" ] && VERB="Working"
+        emit working "$VERB" "$PREVIEW"
         ;;
     post)
         # A tool just finished. If it errored, flash an error state with the
@@ -287,7 +294,10 @@ except: print('')
         # a compaction just finished — flip to the "Compacted" success state. Ignore the rest
         # so a fresh launch/resume never clobbers the live state.
         SRC=$(echo "$INPUT" | python3 -c "import sys,json;print(json.load(sys.stdin).get('source','') or '')" 2>/dev/null)
-        if [ "$SRC" = "compact" ]; then emit compacted "Compacted" ""; fi
+        # The latest assistant usage at this instant is the *summarization* call, which read the
+        # full pre-compaction context — i.e. stale-high. Force the ring low so it reflects the new
+        # compacted size; the next real turn recomputes the accurate value.
+        if [ "$SRC" = "compact" ]; then CTX=0; emit compacted "Compacted" ""; fi
         ;;
     *)
         exit 0

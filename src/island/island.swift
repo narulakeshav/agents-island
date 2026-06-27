@@ -17,6 +17,10 @@ import CoreText
 let kEventDir = NSString("~/.claude-island").expandingTildeInPath
 let kEventFile = kEventDir + "/event.json"
 let kSessionsDir = kEventDir + "/sessions"     // one <tabUUID>.json per live session
+// Claude Code's own per-session state files (one <pid>.json each, keyed by sessionId).
+// CC updates `status` (busy/idle) live, independent of our hooks — the freshest signal
+// for whether a session is actually computing right now. Reverse-engineered, no API.
+let kCCSessionsDir = NSString("~/.claude/sessions").expandingTildeInPath
 let kProjectOrderFile = kEventDir + "/project-order"   // persisted dropdown group order (first-seen)
 let kGifPath = kEventDir + "/claude.gif"               // working
 let kThinkingGifPath = kEventDir + "/claude-thinking.gif"  // thinking
@@ -88,6 +92,8 @@ let kHeaderHeight: CGFloat = 22   // dropdown section-header (project label) hei
 let kDropdownVPad: CGFloat = 6    // vertical padding below the pill row, inside the sheet
 let kDropdownBottomPad: CGFloat = 6   // padding below the last row, inside the rounded bottom
 let kRowInset: CGFloat = 14       // row horizontal inset from the sheet edge
+let kFrontPeek: CGFloat = 22      // how far the front pill grows DOWN on hover to show its title
+let kFrontExpandRadius: CGFloat = 28  // bottom corner radius while the front pill is expanded
 
 /// One entry in the dropdown: either a project section header or a session row. Headers
 /// appear only when the roster spans more than one project; a single-project list is flat.
@@ -165,6 +171,11 @@ final class IslandState: ObservableObject {
     @Published var dropdownOpen = false
     @Published var hoveredRow: String? = nil    // dropdown row under the cursor
     @Published var hoveredRing: String? = nil   // dropdown row whose context ring is hovered
+
+    // Front-pill hover: while true the primary island grows DOWN by kFrontPeek and shows
+    // the front session's title at the bottom-center — a quick "which session is this?"
+    // peek. Driven by the controller's mouse monitor (onHover never fires in this panel).
+    @Published var frontHovered = false
 
     static let shared = IslandState()
 }
@@ -302,6 +313,13 @@ struct IslandShape: Shape {
     var topRadius: CGFloat = 16     // shoulder (re-entrant) fillet radius
     var bottomRadius: CGFloat = 16  // bottom convex corner radius
 
+    // Let the corner radii interpolate frame-by-frame so the bottom corners round out
+    // smoothly as the pill expands (otherwise the radius would snap to its new value).
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(topRadius, bottomRadius) }
+        set { topRadius = newValue.first; bottomRadius = newValue.second }
+    }
+
     func path(in rect: CGRect) -> Path {
         let w = rect.width, h = rect.height
         let r = max(0, min(topRadius, w / 2, h))
@@ -348,7 +366,9 @@ struct IslandView: View {
 
     private static let coral = Color(red: 232 / 255, green: 112 / 255, blue: 78 / 255) // #E8704E
 
-    private static let amber = Color(red: 1.0, green: 0.745, blue: 0.0) // #FFBE00
+    private static let amber = Color(red: 1.0, green: 0.745, blue: 0.0) // #FFBE00 (reserved: thinking)
+
+    private static let orange = Color(red: 1.0, green: 0.584, blue: 0.0) // #FF9500 (attention: input needed)
 
     private static let red = Color(red: 0.898, green: 0.282, blue: 0.302) // #E5484D
 
@@ -410,6 +430,7 @@ struct IslandView: View {
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: state.mode)
         .animation(.spring(response: 0.3, dampingFraction: 0.85), value: state.hoveredCard)
         .animation(.spring(response: 0.3, dampingFraction: 0.9), value: state.dropdownOpen)
+        .animation(.spring(response: 0.5, dampingFraction: 0.64), value: state.frontHovered)
         .animation(.easeOut(duration: 0.12), value: state.hoveredRow)
         // Grow/shrink the bar smoothly when its width changes (verb/preview text updates)
         // instead of snapping to the new size.
@@ -510,7 +531,7 @@ struct IslandView: View {
         .offset(x: islandOffset + kAgentsPeek)
         .zIndex(-1)
         .contentShape(Rectangle())
-        .onTapGesture { AppController.shared?.toggleDropdown() }
+        .onTapGesture { AppController.shared?.openDropdown() }
     }
 
     // The "{n} ⌄" label, rendered as a direct ZStack child positioned at the peek
@@ -534,7 +555,7 @@ struct IslandView: View {
         .contentShape(Rectangle())
         .offset(x: islandOffset + pillWidth / 2 + kAgentsPeek / 2 - 11)
         .zIndex(1)
-        .onTapGesture { AppController.shared?.toggleDropdown() }
+        .onTapGesture { AppController.shared?.openDropdown() }
     }
 
     // Sheet width / total height when expanded (shared with the controller hit-test).
@@ -613,7 +634,12 @@ struct IslandView: View {
         if status == "attention" {
             Image(systemName: "exclamationmark")
                 .font(.system(size: 12, weight: .bold))
-                .foregroundColor(IslandView.red)
+                .foregroundColor(IslandView.orange)
+                .frame(width: 8)
+        } else if status == "compacted" {
+            Image(systemName: "checkmark")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(IslandView.compact)
                 .frame(width: 8)
         } else {
             Circle().fill(dotColor(status)).frame(width: 8, height: 8)
@@ -628,11 +654,26 @@ struct IslandView: View {
             : (card.isSelected ? Color.white.opacity(0.10) : Color.clear)
         return HStack(spacing: 10) {
             rowMarker(card.status)
-            Text(card.title.isEmpty ? card.project : card.title)
-                .font(.custom(kSansFontName, size: 13))
-                .foregroundColor(card.isSelected ? .white : Color(white: 0.9))
-                .lineLimit(1)
-                .layoutPriority(1)            // title keeps its width; preview yields first
+            Group {
+                // A just-compacted session flags itself with a blue "Compacted" prefix, and
+                // a session waiting on the user with an amber "Input Needed" one, so the state
+                // is legible in the list ahead of the tab's own title.
+                if card.status == "compacted" {
+                    Text("Compacted ").foregroundColor(IslandView.compact)
+                        + Text(card.title.isEmpty ? card.project : card.title)
+                            .foregroundColor(card.isSelected ? .white : Color(white: 0.9))
+                } else if card.status == "attention" {
+                    Text("Input Needed ").foregroundColor(IslandView.orange)
+                        + Text(card.title.isEmpty ? card.project : card.title)
+                            .foregroundColor(card.isSelected ? .white : Color(white: 0.9))
+                } else {
+                    Text(card.title.isEmpty ? card.project : card.title)
+                        .foregroundColor(card.isSelected ? .white : Color(white: 0.9))
+                }
+            }
+            .font(.custom(kSansFontName, size: 13))
+            .lineLimit(1)
+            .layoutPriority(1)            // title keeps its width; preview yields first
             // Latest action / message in grey, filling the gap and truncating with an
             // ellipsis. Its expanding frame also right-pins the ring + timer.
             if !card.preview.isEmpty {
@@ -779,19 +820,44 @@ struct IslandView: View {
             .frame(width: rightW, alignment: .trailing)
         }
         .padding(.horizontal, 18)
-        .frame(width: pillWidth, height: islandHeight)
+        .frame(width: pillWidth, height: islandHeight)   // top row stays pinned to the notch
+        // Background grows DOWN by the peek on hover; the row above stays put, and the
+        // session title fades in at the bottom-center of the revealed strip.
+        .frame(width: pillWidth, height: islandHeight + frontPeekH, alignment: .top)
         .background(
             // When the dropdown is open, the expanded sheet draws the background; the
-            // pill's own shape would otherwise leave a seam mid-sheet.
-            IslandShape(topRadius: state.topRadius, bottomRadius: state.bottomRadius)
+            // pill's own shape would otherwise leave a seam mid-sheet. While expanded the
+            // bottom corners round out more (animated via IslandShape.animatableData) so
+            // the grown pill reads as a soft lozenge rather than a stretched rectangle.
+            IslandShape(topRadius: state.topRadius,
+                        bottomRadius: frontPeekH > 0 ? kFrontExpandRadius : state.bottomRadius)
                 .fill(state.dropdownOpen ? Color.clear : Color.black)
         )
+        .overlay(alignment: .bottom) {
+            if frontPeekH > 0 && !state.title.isEmpty {
+                Text(state.title)
+                    .font(.custom(kSansFontName, size: 11))
+                    .foregroundColor(Color(white: 0.66))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: pillWidth - 28)
+                    .padding(.bottom, 5)
+                    // Fade + rise into place so it doesn't just blink on.
+                    .opacity(state.frontHovered ? 1 : 0)
+                    .offset(y: state.frontHovered ? 0 : 5)
+                    .environment(\.colorScheme, .dark)
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture { AppController.shared?.handleIslandClick() }
         // Shift so the notch gap stays centered on the camera even when the two
         // sides differ in width — neither side can slide behind the notch.
         .offset(x: islandOffset)
     }
+
+    // Extra height the front pill takes on hover (0 normally). Suppressed while the
+    // dropdown is open — the expanded sheet already names every session there.
+    private var frontPeekH: CGFloat { (state.frontHovered && !state.dropdownOpen) ? kFrontPeek : 0 }
 
     private var primary: String {
         switch state.mode {
@@ -947,6 +1013,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var panel: NotchPanel!
     private var clockTimer: Timer?
     private var gcTimer: Timer?
+    private var liveTimer: Timer?   // fast poll of CC's live status + transcript tail
 
     private var sessions: [String: LiveSession] = [:]
     private var liveTabs: Set<String> = []      // interactive (non-forked) tab UUIDs
@@ -1018,6 +1085,17 @@ final class AppController: NSObject, NSApplicationDelegate {
         RunLoop.main.add(g, forMode: .common)
         gcTimer = g
 
+        // Fast live poll: reads CC's own busy/idle status files and tails each transcript so
+        // the verb/preview/active-state track real activity at sub-second latency instead of
+        // only updating when a hook fires (the "always one transcript behind" problem). All
+        // IO runs off the main thread; it no-ops when there are no sessions.
+        let lt = Timer(timeInterval: 0.6, repeats: true) { [weak self] _ in
+            self?.pollLiveStatus()
+        }
+        lt.tolerance = 0.2
+        RunLoop.main.add(lt, forMode: .common)
+        liveTimer = lt
+
         // Drive back-card hover ourselves. SwiftUI's onHover relies on a tracking area
         // that only fires in the key window, and this non-activating panel can never
         // become key — so onHover never fires (verified). Instead we watch mouse moves
@@ -1065,10 +1143,28 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         // Capture clicks only while the cursor is over the island; otherwise stay
         // transparent so the menu bar / status items underneath remain clickable.
-        panel.ignoresMouseEvents = !pointInIslandHitArea(p)
+        let overIsland = pointInIslandHitArea(p)
+        panel.ignoresMouseEvents = !overIsland
 
-        // Dropdown mode: hit-test the open menu's rows; nothing else hovers.
+        // Front-pill peek: hovering the primary pill grows it down to show the session
+        // title. Suppressed while the dropdown is open (the sheet names everything there).
+        let front = !s.dropdownOpen && pointInFrontPill(p)
+        if s.frontHovered != front { setFrontHover(front) }
+
+        // Dropdown mode: hover-driven open/close. Hovering the "{n} ⌄" peek drops the
+        // menu down; moving the cursor off the expanded sheet closes it. (SwiftUI's
+        // onHover never fires in this non-key panel, so we drive it from the monitor.)
+        // The trigger is the peek only — never the front pill — so the front ticker's
+        // own hover/click-to-focus is unaffected. Once open, `overIsland` covers the
+        // whole sheet, so the larger sheet region holds it open until the cursor leaves.
         if s.uiMode == "dropdown" {
+            if s.roster.count > 1 {
+                if !s.dropdownOpen {
+                    if pointInBackPillPeek(p) { openDropdown() }
+                } else if !overIsland {
+                    closeDropdown()
+                }
+            }
             updateRowHover(p: p, f: f)
             return
         }
@@ -1116,11 +1212,41 @@ final class AppController: NSObject, NSApplicationDelegate {
         var bottom = f.maxY - islandH
         let top = f.maxY
         if s.roster.count > 1 { right += kAgentsPeek }  // "{n} ⌄" back pill peeks right
+        if s.frontHovered && !s.dropdownOpen { bottom -= kFrontPeek }  // title-peek strip stays clickable
         if s.dropdownOpen {
             right = left + curPillWidth + kSheetSide     // sheet grows right…
             bottom = f.maxY - (islandH + dropdownContentHeight(s.dropdownItems) + kDropdownVPad + kDropdownBottomPad)  // …and down
         }
         return p.x >= left - m && p.x <= right + m && p.y >= bottom - m && p.y <= top
+    }
+
+    /// True if a screen point falls within the "{n} ⌄" peek band — the strip just right
+    /// of the front pill where the back-pill indicator sits. This is the hover-open
+    /// trigger (deliberately the peek only, so hovering the front ticker never opens the
+    /// menu). Geometry mirrors the right edge used by `pointInIslandHitArea`.
+    private func pointInBackPillPeek(_ p: NSPoint) -> Bool {
+        let s = IslandState.shared
+        guard s.roster.count > 1 else { return false }
+        let f = panel.frame
+        let islandH = max(s.notchHeight, 30)
+        let pillRight = f.midX + curIslandOffset + curPillWidth / 2
+        let m: CGFloat = 4
+        return p.x >= pillRight - m && p.x <= pillRight + kAgentsPeek + m
+            && p.y >= f.maxY - islandH && p.y <= f.maxY
+    }
+
+    /// True if a screen point falls within the front pill — the trigger for the title
+    /// peek. Once the peek is showing, the live region extends down by kFrontPeek so the
+    /// cursor moving onto the revealed title strip holds it open (hysteresis, no flicker).
+    private func pointInFrontPill(_ p: NSPoint) -> Bool {
+        let s = IslandState.shared
+        let f = panel.frame
+        let islandH = max(s.notchHeight, 30)
+        let center = f.midX + curIslandOffset
+        let left = center - curPillWidth / 2
+        let right = center + curPillWidth / 2
+        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
+        return p.x >= left && p.x <= right && p.y >= bottom && p.y <= f.maxY
     }
 
     /// Close the open dropdown when a click lands outside the expanded sheet's bounds.
@@ -1194,6 +1320,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func setFrontHover(_ on: Bool) {
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.64)) {
+            IslandState.shared.frontHovered = on
+        }
+    }
+
     /// Run the expensive process scan + transcript checks on a background queue,
     /// then apply the results (prune dead/canceled sessions, rebuild) on main.
     private func refreshLiveness() {
@@ -1261,20 +1393,26 @@ final class AppController: NSObject, NSApplicationDelegate {
         let w: CGFloat = 1100
         let s = IslandState.shared
         let dropH = s.dropdownOpen ? dropdownContentHeight(s.dropdownItems) + kDropdownVPad + kDropdownBottomPad : 0
-        let h: CGFloat = max(nh, 30) + 2 + dropH
+        // Always reserve room for the front-pill hover peek so its expand/collapse animates
+        // smoothly inside a transparent panel (no resize-on-hover that would clip the spring).
+        let h: CGFloat = max(nh, 30) + 2 + max(dropH, kFrontPeek)
         let x = screen.frame.midX - w / 2
         let y = screen.frame.maxY - h
         panel.setFrame(NSRect(x: x, y: y, width: w, height: h), display: true)
     }
 
-    /// Open/close the dropdown menu and resize the panel to fit it.
-    func toggleDropdown() {
+    /// Open the dropdown menu (idempotent) and resize the panel to fit it. Driven by
+    /// hovering the "{n} ⌄" peek; a tap on the peek also calls this as a fallback. It
+    /// never closes — closing is purely hover-leave (or a click outside the sheet) — so a
+    /// tap while the cursor still rests on the peek can't toggle it shut and reopen.
+    func openDropdown() {
         let s = IslandState.shared
-        s.dropdownOpen.toggle()
-        if s.dropdownOpen { refreshActiveTab() }   // freshest active-tab highlight on open
+        guard !s.dropdownOpen else { return }
+        s.dropdownOpen = true
+        refreshActiveTab()   // freshest active-tab highlight on open
         // Lock the current row order on open so timers/activity can't reshuffle rows under
         // the cursor; release it on close so the list re-sorts by recency again.
-        dropdownFrozenOrder = s.dropdownOpen ? s.roster.map { $0.id } : nil
+        dropdownFrozenOrder = s.roster.map { $0.id }
         position()
     }
     func closeDropdown() {
@@ -1317,6 +1455,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         let label = s.aiTitle.isEmpty ? s.project : s.aiTitle
         if !label.isEmpty { liveTabTitle[id] = label }
         if let v = sf.context { s.context = v; if v > 0 { liveTabContext[id] = v } }
+        // Compaction shrank the window: drop the remembered fill so a later idle entry
+        // for this tab doesn't resurrect the stale pre-compaction ring.
+        if s.mode == "compacted" { liveTabContext[id] = 0 }
         if let v = sf.focus { s.focus = v }
         if let v = sf.cwd { s.cwd = v }
         if let v = sf.transcript { s.transcript = v }
@@ -1371,6 +1512,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         state.detail = f.detail
         state.preview = f.preview
         state.project = f.project
+        // The front session's AI title (its directory name if it hasn't earned one yet),
+        // surfaced by the on-hover front-pill peek.
+        state.title = f.aiTitle.isEmpty ? f.project : f.aiTitle
         state.contextPct = f.context
         state.focusURL = f.focus
 
@@ -1502,6 +1646,147 @@ final class AppController: NSObject, NSApplicationDelegate {
         return false
     }
 
+    // MARK: - Live status poll (freshest activity, between hook events)
+
+    /// Map sessionId → CC's live status ("busy"/"idle"), read from Claude Code's own
+    /// per-session state files. CC rewrites these continuously, so this leads our hooks.
+    /// Safe off the main thread (small files, plain reads).
+    private func ccSessionStatuses() -> [String: String] {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: kCCSessionsDir) else { return [:] }
+        var out: [String: String] = [:]
+        for f in files where f.hasSuffix(".json") {
+            guard let data = fm.contents(atPath: kCCSessionsDir + "/" + f),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let sid = obj["sessionId"] as? String,
+                  let st = obj["status"] as? String else { continue }
+            out[sid] = st
+        }
+        return out
+    }
+
+    private func verbForTool(_ name: String) -> String {
+        switch name {
+        case "Read":                              return "Reading"
+        case "Edit", "Write", "MultiEdit", "NotebookEdit": return "Editing"
+        case "Grep", "Glob":                      return "Searching"
+        case "Bash", "BashOutput", "KillShell":   return "Running"
+        case "WebFetch":                          return "Fetching"
+        case "WebSearch":                         return "Searching the web"
+        case "Task", "Agent":                     return "Delegating"
+        case "TodoWrite":                         return "Planning"
+        default:                                  return "Working"   // incl. mcp__* tools
+        }
+    }
+
+    /// Concrete object a tool is acting on (file basename / command / pattern), mirroring
+    /// the hook so the pill's right side stays specific ("Reading | island.swift").
+    private func toolTarget(_ tool: String, _ input: [String: Any]) -> String {
+        func base(_ p: String) -> String { (p as NSString).lastPathComponent }
+        switch tool {
+        case "Read", "Edit", "MultiEdit", "Write": return base(input["file_path"] as? String ?? "")
+        case "NotebookEdit":                       return base(input["notebook_path"] as? String ?? "")
+        case "Bash": return (input["command"] as? String ?? "").split(separator: " ").first.map(String.init) ?? ""
+        case "Grep", "Glob":                       return input["pattern"] as? String ?? ""
+        default:                                   return ""
+        }
+    }
+
+    /// Tail the transcript for the *live* activity: the latest assistant entry's final block
+    /// gives the real verb ("Thinking" during an extended-thinking block, else the running
+    /// tool), and the most recent non-empty assistant text is the freshest preview. File IO,
+    /// run off the main thread. Returns nil if nothing usable was found.
+    private func transcriptActivity(_ path: String) -> (preview: String, verb: String, thinking: Bool)? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        let size = fh.seekToEndOfFile()
+        fh.seek(toFileOffset: size > 16_384 ? size - 16_384 : 0)
+        guard let data = try? fh.readToEnd(), let s = String(data: data, encoding: .utf8) else { return nil }
+        var textPreview = "", action = "", verb = "", thinking = false
+        var classified = false
+        for line in s.split(separator: "\n").reversed() {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  obj["type"] as? String == "assistant",
+                  let msg = obj["message"] as? [String: Any],
+                  let content = msg["content"] as? [[String: Any]] else { continue }
+            // The very latest assistant entry decides the verb (what it's doing right now);
+            // a running tool also yields a concrete object for the preview.
+            if !classified, let last = content.last(where: { ($0["type"] as? String) != nil }) {
+                switch last["type"] as? String {
+                case "thinking": thinking = true; verb = "Thinking"
+                case "tool_use":
+                    verb = verbForTool(last["name"] as? String ?? "")
+                    action = toolTarget(last["name"] as? String ?? "", last["input"] as? [String: Any] ?? [:])
+                case "text":     verb = "Responding"
+                default:         break
+                }
+                classified = true
+            }
+            // Fallback preview = first line of the most recent non-empty text block (may be an
+            // earlier entry than the one that set the verb, e.g. when it's now running a tool).
+            if textPreview.isEmpty {
+                let texts = content.compactMap { ($0["type"] as? String) == "text" ? $0["text"] as? String : nil }
+                if let t = texts.last(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+                    let first = t.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "\n").first ?? ""
+                    textPreview = String(first.prefix(120))
+                }
+            }
+            if classified && !textPreview.isEmpty { break }
+        }
+        if !classified && textPreview.isEmpty { return nil }
+        // Tool action (concrete object) wins for the preview; otherwise the latest text.
+        return (action.isEmpty ? textPreview : action, verb, thinking)
+    }
+
+    /// Fires ~2×/sec. Reconciles each known session against CC's live busy/idle status and
+    /// the transcript tail, so the pill reflects real activity without waiting for a hook.
+    /// Deliberately conservative: attention/error/compacting/compacted are hook-owned and
+    /// never overridden here (avoids re-introducing false "waiting for input").
+    @objc private func pollLiveStatus() {
+        guard !sessions.isEmpty else { return }
+        // Snapshot (tabUUID, sessionId, transcript) for sessions that have a transcript.
+        let snap: [(String, String, String)] = sessions.compactMap { (k, v) in
+            guard !v.transcript.isEmpty else { return nil }
+            let sessionId = ((v.transcript as NSString).lastPathComponent as NSString).deletingPathExtension
+            return (k, sessionId, v.transcript)
+        }
+        guard !snap.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let statuses = self.ccSessionStatuses()
+            var acts: [String: (preview: String, verb: String, thinking: Bool)] = [:]
+            for (uuid, _, tx) in snap {
+                if let a = self.transcriptActivity(tx) { acts[uuid] = a }
+            }
+            DispatchQueue.main.async {
+                var changed = false
+                let now = Date().timeIntervalSince1970
+                for (uuid, sessionId, _) in snap {
+                    guard let s = self.sessions[uuid] else { continue }
+                    let protected = (s.mode == "compacting" || s.mode == "compacted"
+                                     || s.mode == "attention" || s.mode == "error")
+                    if !protected, let st = statuses[sessionId] {
+                        if st == "busy" {
+                            // Actively computing: pick thinking vs working from the transcript.
+                            let newMode = (acts[uuid]?.thinking ?? false) ? "thinking" : "working"
+                            if s.mode != "working" && s.mode != "thinking" { s.turnStartTs = now }
+                            if s.mode != newMode { s.mode = newMode; changed = true }
+                            if let v = acts[uuid]?.verb, !v.isEmpty, s.detail != v { s.detail = v; changed = true }
+                        } else if s.mode == "working" || s.mode == "thinking" {
+                            // CC went idle but we're still showing active → the turn ended and
+                            // we haven't seen the Stop hook yet. Settle to "done" immediately.
+                            s.mode = "done"; s.ts = now; changed = true
+                        }
+                    }
+                    // Freshest preview in every state (cheap; no-op when unchanged).
+                    if let p = acts[uuid]?.preview, !p.isEmpty, s.preview != p { s.preview = p; changed = true }
+                }
+                if changed { self.rebuild() }
+            }
+        }
+    }
+
     /// Latest session title from the transcript: a manual /rename (`custom-title`) wins over
     /// Claude's auto `ai-title`. Reads a tail (a just-made rename is near the end) so the
     /// periodic scan stays cheap. File IO, safe off the main thread.
@@ -1609,7 +1894,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         closeDropdown()
         guard let front = frontUUID, let f = sessions[front] else { activateWarp(); return }
         openFocus(f.focus)
-        if f.mode == "done" {
+        // A finished or just-compacted session is a terminal "you can dismiss me" state —
+        // clicking takes the user there and clears the card.
+        if f.mode == "done" || f.mode == "compacted" {
             sessions.removeValue(forKey: front)
             try? FileManager.default.removeItem(atPath: kSessionsDir + "/" + front + ".json")
             clickFocus = nil

@@ -1135,6 +1135,13 @@ struct IslandView: View {
             BusyGlyph(color: IslandView.coral, interval: 0.20)
         } else if status == "thinking" {
             BusyGlyph(color: ultra ? IslandView.ultraRed : IslandView.amber, interval: 0.3)
+        } else if status == "done" {
+            // A finished turn reads as a static busy-glyph mark rather than a plain dot —
+            // grey/idle stays a dot (see the fallback below).
+            Text("✻")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(IslandView.green)
+                .frame(width: 8, height: 8)
         } else {
             Circle().fill(ultra ? IslandView.ultraRed : dotColor(status)).frame(width: 8, height: 8)
         }

@@ -25,7 +25,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/narulakeshav/claude-notification.git"
+    "url": "https://github.com/narulakeshav/claudeisland.git"
+  },
+  "homepage": "https://github.com/narulakeshav/claudeisland#readme",
+  "bugs": {
+    "url": "https://github.com/narulakeshav/claudeisland/issues"
   },
   "author": "Keshav Narula",
   "license": "MIT"

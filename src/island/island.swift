@@ -22,13 +22,6 @@ let kSessionsDir = kEventDir + "/sessions"     // one <tabUUID>.json per live se
 // for whether a session is actually computing right now. Reverse-engineered, no API.
 let kCCSessionsDir = NSString("~/.claude/sessions").expandingTildeInPath
 let kProjectOrderFile = kEventDir + "/project-order"   // persisted dropdown group order (first-seen)
-let kGifPath = kEventDir + "/claude.gif"               // working
-let kThinkingGifPath = kEventDir + "/claude-thinking.gif"  // thinking
-let kCompactingGifPath = kEventDir + "/claude-compacting.gif"  // compacting
-let kUltraThinkGifPath = kEventDir + "/claude-ultra_think.gif"  // ultrathink (front pill, single session)
-let kDoneImagePath = kEventDir + "/claude-done.tiff"       // success
-let kPausedImagePath = kEventDir + "/claude-paused.tiff"   // idle / resting (legacy)
-let kIdleIconPath = kEventDir + "/cc-icon.png"             // idle / resting
 let kDarwinName = "com.claude-island.event"
 
 // EXPERIMENT: lead each dropdown row with the session's opening user prompt instead of
@@ -142,7 +135,7 @@ let kHeaderHeight: CGFloat = 22   // dropdown section-header (project label) hei
 let kDropdownVPad: CGFloat = 6    // vertical padding below the pill row, inside the sheet
 let kDropdownBottomPad: CGFloat = 6   // padding below the last row, inside the rounded bottom
 let kRowInset: CGFloat = 14       // row horizontal inset from the sheet edge
-let kFrontPeek: CGFloat = 22      // how far the front pill grows DOWN on hover to show its title
+let kFrontPeek: CGFloat = 23      // how far the front pill grows DOWN on hover to show its title (+1 over the text's own height so descenders like "g" don't clip)
 let kFrontExpandRadius: CGFloat = 28  // bottom corner radius while the front pill is expanded
 
 /// One entry in the dropdown: either a project section header or a session row. Headers
@@ -219,10 +212,18 @@ final class IslandState: ObservableObject {
     @Published var contextPct: Double = 0    // 0…1 fill of the context window
     @Published var focusURL: String = ""     // warp://session/<uuid> for this tab
     @Published var showTermIcons = false     // roster spans ≥2 terminal apps → tag each row with its app icon
+    @Published var firstRunHint = false      // first idle after install: peek shows a "hover to summon me" teach
     @Published var idleHint: Bool = false    // idle peek, stage 1: icon-only pulsing hint (pre-reveal)
     @Published var idleReveal: Double = 1    // 0→1 bouncy scale/opacity entrance for the idle peek
     @Published var idleWaking: Bool = false  // brief "still alive" wink on click: swaps the
                                               // static resting mark for the live gif, then settles back
+    // A freshly-finished front session briefly shows its own reply in the right-side slot instead
+    // of the tab name — confirmation of what just happened before it hands back off. The
+    // controller (rebuild()) only ever sets this on a fresh arrival at "done" / clears it once the
+    // front leaves "done" entirely; the actual multi-second animation (marquee in, white → grey,
+    // slide out to the tab name) is fully owned and self-timed by `FinishFlash` in the view — see
+    // its doc comment for why this can't be a normal SwiftUI `.animation`.
+    @Published var justFinishedID: String? = nil     // frontUUID whose flash should be (re)triggered
 
     // ── Multi-session aggregate (≥2 sessions that have actually run) ─────────────
     // Past one session the front pill stops narrating a single tab and shows fleet
@@ -302,19 +303,78 @@ final class IslandState: ObservableObject {
     static let shared = IslandState()
 }
 
-/// Per-letter rainbow gradient for the "ultrathink" verb — each glyph stepped across a warm→cool
-/// hue sweep, mirroring Claude Code's own ultrathink styling. Color only, so the text content and
-/// measured width are unchanged (pill geometry doesn't drift).
-func rainbowText(_ s: String) -> Text {
+/// Drives the "ultrathink" rainbow's continuous color cycle — shared (not per-instance) so the
+/// verb text and its matching glyph marker, separate views, animate in exact sync (including
+/// across multiple simultaneously-visible ultrathink rows). Started lazily on first use and left
+/// running for the app's remaining lifetime; ultrathink is rare enough that the always-on 60Hz
+/// timer costs nothing meaningful.
+final class RainbowClock: ObservableObject {
+    @Published var t: Double = 0
+    static let swapInterval: Double = 0.4   // seconds between each discrete color swap
+    static let shared = RainbowClock()
+    private var timer: Timer?
+    private init() {
+        let tm = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.t += 1.0 / 60.0
+        }
+        RunLoop.main.add(tm, forMode: .common)
+        timer = tm
+    }
+}
+
+/// The "ultrathink" rainbow's fixed discrete palette — specific brand colors (not derived from
+/// any other status color, and not reused for the plain red/amber/green states) that each
+/// letter jumps between, so the effect reads as letters individually SWAPPING color rather
+/// than a gradient sliding across the text.
+let kRainbowPalette: [Color] = [
+    Color(red: 0xFA / 255, green: 0x51 / 255, blue: 0x4F / 255),   // red
+    Color(red: 0xFF / 255, green: 0x7D / 255, blue: 0x40 / 255),   // orange
+    Color(red: 0xFF / 255, green: 0xC0 / 255, blue: 0x48 / 255),   // yellow
+    Color(red: 0x82 / 255, green: 0xCA / 255, blue: 0x7A / 255),   // green
+    Color(red: 0x76 / 255, green: 0xA9 / 255, blue: 0xDF / 255),   // blue
+    Color(red: 0xA0 / 255, green: 0x81 / 255, blue: 0xCD / 255),   // purple
+    Color(red: 0xD4 / 255, green: 0x7E / 255, blue: 0xB7 / 255),   // pink
+]
+
+/// Character `i`'s palette slot at discrete swap-step `step` — subtracting `step` from `i`
+/// before wrapping means a given color moves to a HIGHER index as `step` increases, i.e. it
+/// visibly hands off from an earlier character to the next one (see RainbowClock).
+private func rainbowSlot(_ i: Int, step: Int) -> Int {
+    let n = kRainbowPalette.count
+    return ((i - step) % n + n) % n
+}
+
+/// Per-letter rainbow gradient for the "ultrathink" verb — mirrors Claude Code's own ultrathink
+/// styling. `step` (whole swaps, see RainbowClock) picks each character's slot in the fixed
+/// palette; incrementing it swaps every letter to its neighbor's previous color all at once,
+/// instead of continuously blending hues. Color only, so the text content and measured width
+/// are unchanged (pill geometry doesn't drift).
+func rainbowText(_ s: String, step: Int = 0) -> Text {
     let chars = Array(s)
     guard chars.count > 0 else { return Text("") }
-    let n = max(chars.count - 1, 1)
     var out = Text("")
     for (i, ch) in chars.enumerated() {
-        let hue = 0.02 + (Double(i) / Double(n)) * 0.82   // red-orange → violet
-        out = out + Text(String(ch)).foregroundColor(Color(hue: hue, saturation: 0.75, brightness: 1.0))
+        out = out + Text(String(ch)).foregroundColor(kRainbowPalette[rainbowSlot(i, step: step)])
     }
     return out
+}
+
+/// The animated form of `rainbowText`, isolated in its own tiny view so the re-render from
+/// RainbowClock stays scoped to just this text run instead of the whole dropdown/pill.
+/// `trailing` lets a dropdown row concatenate the (flat-colored) title onto the same `Text` —
+/// keeping verb+title as one continuous run so line-wrap/truncation still behaves as a unit.
+struct RainbowVerb: View {
+    let text: String
+    var trailing: Text? = nil
+    @ObservedObject private var clock = RainbowClock.shared
+
+    var body: some View {
+        let step = Int(clock.t / RainbowClock.swapInterval)
+        let verb = rainbowText(text, step: step)
+            .font(.custom(kSerifFontName, size: 13)).tracking(0.5)
+        if let trailing { return verb + trailing }
+        return verb
+    }
 }
 
 /// A background session in the stack (one per other active Warp tab).
@@ -392,32 +452,9 @@ struct SessionFile: Decodable {
     let ultra: Bool?           // turn invoked with "ultrathink" → rainbow verb
 }
 
-/// Drives the spinner from a real run-loop timer. SwiftUI's `repeatForever`
-/// animations don't reliably run inside a non-activating background panel, so
-/// we step the angle ourselves and only run while there's something to spin.
-final class Ticker: ObservableObject {
-    @Published var angle: Double = 0
-    private var timer: Timer?
-    static let shared = Ticker()
-
-    func start() {
-        guard timer == nil else { return }
-        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.angle = (self.angle + 4).truncatingRemainder(dividingBy: 360)
-        }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
-    }
-
-    func stop() {
-        timer?.invalidate()
-        timer = nil
-    }
-}
-
-/// Self-stepped clock for the hover-peek marquee. Like `Ticker`, a real run-loop timer is
-/// required — SwiftUI's animation clock is frozen in the non-activating panel. `phase` is the
+/// Self-stepped clock for the hover-peek marquee. SwiftUI's `repeatForever` animations
+/// don't reliably run inside this non-activating background panel, so we step it
+/// ourselves via a real run-loop timer. `phase` is the
 /// scroll offset in points; the view wraps it modulo the text's period.
 final class MarqueeClock: ObservableObject {
     @Published var phase: CGFloat = 0
@@ -451,6 +488,14 @@ struct Marquee: View {
     let color: Color
     let width: CGFloat
     @ObservedObject var clock: MarqueeClock
+    // False for content that's freshly shown (its true beginning, not a continuous loop the
+    // viewer only ever catches mid-scroll) — e.g. `FinishFlashView`'s reply. The peek's own
+    // continuously-cycling feed wants the default `true`: both edges perpetually have text
+    // scrolling in/out, so fading the leading edge there hides the seam. But for content that
+    // STARTS static (see `FinishFlashView`'s pre-scroll pause) before any scrolling begins, that
+    // same leading fade dims the message's own opening words toward invisible from frame one —
+    // there's nothing "scrolling in" yet to justify it.
+    var fadeLeadingEdge: Bool = true
     private static let font = NSFont(name: kSansFontName, size: 13) ?? .systemFont(ofSize: 13)
     private static let gap: CGFloat = 48
 
@@ -478,14 +523,14 @@ struct Marquee: View {
         }
         // Soft fade at both edges so the text dissolves in/out rather than hard-clipping —
         // only while it scrolls (static text sits clear of the edges, so no fade needed).
-        .mask(overflow ? AnyView(Marquee.edgeFade(width)) : AnyView(Rectangle()))
+        .mask(overflow ? AnyView(Marquee.edgeFade(width, leading: fadeLeadingEdge)) : AnyView(Rectangle()))
     }
 
-    private static func edgeFade(_ width: CGFloat) -> some View {
+    private static func edgeFade(_ width: CGFloat, leading: Bool = true) -> some View {
         let f = min(0.28, 24 / max(width, 1))   // ~24pt fade on each side
         return LinearGradient(stops: [
-            .init(color: .clear, location: 0),
-            .init(color: .black, location: f),
+            .init(color: leading ? .clear : .black, location: 0),
+            .init(color: .black, location: leading ? f : 0),
             .init(color: .black, location: 1 - f),
             .init(color: .clear, location: 1),
         ], startPoint: .leading, endPoint: .trailing)
@@ -598,7 +643,7 @@ struct QueuePeek: View {
     let width: CGFloat
     @ObservedObject var clock: MarqueeClock
     @StateObject private var feed = PeekFeed()
-    private let lineH: CGFloat = 15
+    private let lineH: CGFloat = 17   // > the 13pt font's natural line height so descenders (g, y, p) don't clip
 
     var body: some View {
         ZStack {
@@ -620,6 +665,130 @@ struct QueuePeek: View {
 
     // White at tint=0, settling to the peek grey at tint=1.
     private var curColor: Color { Color(white: 1.0 - (1.0 - baseWhite) * feed.tint) }
+}
+
+/// Drives the front pill's "just finished" moment (see `showingFinishFlash`): the agent's own
+/// reply marquees in white, eases to grey over ~3s (same curve/duration as `PeekFeed.tint`), holds,
+/// then hands off — sliding up and out — to the tab name rising in from below in grey (same
+/// slide curve as `PeekFeed.slide`). Deliberately NOT a SwiftUI `.animation`/`.transition`: those
+/// ride SwiftUI's own animation clock, which doesn't reliably tick in this non-activating panel
+/// with nothing forcing a frame (no hover, no user interaction) — exactly the trap `Ticker` /
+/// `GlyphClock` / `PeekFeed` already work around by self-stepping via `Timer` + `CACurrentMediaTime`
+/// and publishing plain 0...1 progress the view applies directly (no implicit animation involved).
+final class FinishFlash: ObservableObject {
+    @Published var message: String = ""
+    @Published var tint: CGFloat = 0     // 0 = white (just shown) → 1 = settled grey, over ~3s
+    @Published var slide: CGFloat = 0    // 0 = showing the message → 1 = fully handed off to the tab name
+
+    private var tintTimer: Timer?
+    private var slideTimer: Timer?
+    private var holdTimer: Timer?
+
+    /// (Re)starts the sequence for a freshly-finished session. `onHandoff` fires once the slide
+    /// to the tab name completes — the caller uses it to stop rendering this view entirely
+    /// (see `IslandState.justFinishedID`) rather than leaving a redundant fixed-width box around
+    /// forever once it's just displaying the same tab name the plain path would anyway.
+    /// The tab name itself is NOT captured here — `FinishFlashView` reads it live (`state.title`
+    /// can update mid-hold, e.g. once the AI title finishes generating a moment after the turn
+    /// ends; capturing a stale copy at start() would make it visibly change size right at the
+    /// handoff, reading as an extra jump on top of the slide itself).
+    func start(message: String, onHandoff: @escaping () -> Void) {
+        stop()
+        self.message = message
+        slide = 0
+        startTint()
+        let hold = Timer(timeInterval: 7.0, repeats: false) { [weak self] _ in
+            self?.startSlide(onHandoff: onHandoff)
+        }
+        RunLoop.main.add(hold, forMode: .common)
+        holdTimer = hold
+    }
+
+    func stop() {
+        tintTimer?.invalidate(); tintTimer = nil
+        slideTimer?.invalidate(); slideTimer = nil
+        holdTimer?.invalidate(); holdTimer = nil
+    }
+
+    private func startTint() {
+        tintTimer?.invalidate(); tint = 0
+        let start = CACurrentMediaTime(); let dur: CFTimeInterval = 3.0
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let e = min(1, (CACurrentMediaTime() - start) / dur)
+            self.tint = CGFloat(e * e * (3 - 2 * e))    // smoothstep: holds white, eases to grey
+            if e >= 1 { self.tintTimer?.invalidate(); self.tintTimer = nil }
+        }
+        RunLoop.main.add(t, forMode: .common); tintTimer = t
+    }
+
+    private func startSlide(onHandoff: @escaping () -> Void) {
+        slideTimer?.invalidate()
+        let start = CACurrentMediaTime(); let dur: CFTimeInterval = 0.34
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let e = min(1, (CACurrentMediaTime() - start) / dur)
+            self.slide = 1 - pow(1 - CGFloat(e), 2.2)    // ease-out
+            if e >= 1 {
+                self.slideTimer?.invalidate(); self.slideTimer = nil
+                onHandoff()
+            }
+        }
+        RunLoop.main.add(t, forMode: .common); slideTimer = t
+    }
+}
+
+/// Renders `FinishFlash`'s sequence: the agent's reply, marqueed within a fixed box if it
+/// overflows (own private `MarqueeClock` — independent of the shared one, which only runs on
+/// pill hover), tinted white → grey; then a `QueuePeek`-style vertical handoff to the tab name.
+struct FinishFlashView: View {
+    @ObservedObject var flash: FinishFlash
+    let width: CGFloat
+    // Passed fresh on every render (NOT captured into `FinishFlash` at .start() time) — the tab
+    // name/title can legitimately change mid-hold (e.g. AI title generation landing a moment
+    // after the turn ends), and a stale copy would visibly resize right at the handoff instead
+    // of matching whatever the plain tab-name view is about to show.
+    let tabName: String
+    @StateObject private var marqueeClock = MarqueeClock()
+    @State private var marqueeStartTimer: Timer?
+    private let lineH: CGFloat = 17
+
+    var body: some View {
+        // `.trailing`: the ZStack's default `.center` would center `tabName` (a bare,
+        // `.fixedSize()` Text with no frame of its own) inside the fixed `width` box — fine
+        // while it's still narrower than a full flash message, but it doesn't match how the SAME
+        // text sits once handed off to the plain (natural-width, trailing-aligned) tab name view,
+        // producing a few-pixel sideways pop right at the handoff. `.trailing` here makes it flush
+        // against the same right edge both before and after — Marquee's own internal `.frame`
+        // already fills `width` exactly, so this alignment change doesn't affect it.
+        ZStack(alignment: .trailing) {
+            Marquee(text: flash.message, color: msgColor, width: width, clock: marqueeClock, fadeLeadingEdge: false)
+                .offset(y: -lineH * flash.slide)
+                .opacity(Double(max(0, 1 - flash.slide * 1.5)))
+            Text(tabName)
+                .font(.custom(kSansFontName, size: 13))
+                .foregroundColor(Color(white: 0.62))
+                .lineLimit(1)
+                .fixedSize()
+                .offset(y: lineH * (1 - flash.slide))
+                .opacity(Double(min(1, flash.slide * 1.5)))
+        }
+        .frame(width: width, height: lineH)
+        .clipped()
+        .onAppear {
+            // A beat of stillness before it starts scrolling — reads as "here's the reply",
+            // THEN motion, rather than immediately looking busy the instant it appears.
+            let t = Timer(timeInterval: 1.0, repeats: false) { _ in marqueeClock.start() }
+            RunLoop.main.add(t, forMode: .common)
+            marqueeStartTimer = t
+        }
+        .onDisappear {
+            marqueeStartTimer?.invalidate(); marqueeStartTimer = nil
+            marqueeClock.stop()
+        }
+    }
+
+    private var msgColor: Color { Color(white: 1.0 - (1.0 - 0.62) * Double(flash.tint)) }
 }
 
 /// Small fill bar for the notch usage peek: a dim track with a colored fill proportional to
@@ -682,28 +851,6 @@ private func darwinCallback(_ center: CFNotificationCenter?,
 
 // MARK: - SwiftUI
 
-/// Embeds an animated GIF via AppKit's NSImageView, which animates GIFs on the
-/// main run loop (works inside a background panel where SwiftUI animation won't).
-struct GIFView: NSViewRepresentable {
-    let path: String
-    var animates: Bool = true   // false → show the first frame as a still (resting logo)
-    func makeNSView(context: Context) -> NSImageView {
-        let v = NSImageView()
-        v.imageScaling = .scaleProportionallyUpOrDown
-        v.animates = animates
-        v.image = NSImage(contentsOfFile: path)
-        // Don't let the image's intrinsic 128px size override the SwiftUI .frame.
-        v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        v.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        v.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        v.setContentHuggingPriority(.defaultLow, for: .vertical)
-        return v
-    }
-    func updateNSView(_ v: NSImageView, context: Context) {
-        if v.image == nil { v.image = NSImage(contentsOfFile: path) }
-    }
-}
-
 /// Dynamic-Island silhouette. The top edge spans the full width ("ears"); the
 /// body walls are inset by the shoulder radius. Each top shoulder is a concave,
 /// re-entrant fillet — a quad whose control point sits at the intersection of the
@@ -764,6 +911,7 @@ struct VisualEffectBlur: NSViewRepresentable {
 
 struct IslandView: View {
     @ObservedObject var state = IslandState.shared
+    @StateObject private var finishFlash = FinishFlash()
 
     private static let coral = Color(red: 232 / 255, green: 112 / 255, blue: 78 / 255) // #E8704E
 
@@ -868,8 +1016,8 @@ struct IslandView: View {
         case "compacting", "compacted": return IslandView.compact
         case "struggling":        return IslandView.amber  // stuck in a run of tool errors
         case "declined", "interrupted": return Color(white: 0.6)  // Esc'd — resolved/halted
-        case "stale":             return Color(white: 0.5)   // done, unattended >15 min
-        default:                  return Color.white.opacity(0.45)  // idle — matches the inactive title's alpha, not a flat grey
+        case "stale":             return Color.white.opacity(0.5)   // done, unattended >15 min — same as idle
+        default:                  return Color.white.opacity(0.5)  // idle
         }
     }
 
@@ -1043,34 +1191,12 @@ struct IslandView: View {
                 .font(.custom(kSansFontName, size: 13))
                 .lineLimit(1)
             Spacer(minLength: 8)
-            // Context fill of the active session, floated to the header's right edge: a ring +
-            // "x% context" in the ring's own color. Only on the active header, ≥25% full.
-            if let ctx = headerContext(item), ctx >= 0.25 {
-                HStack(spacing: 5) {
-                    ContextRing(pct: ctx)
-                    Text("\(Int((ctx * 100).rounded()))% context used")
-                        .font(.custom(kSansFontName, size: 11))
-                        .foregroundColor(contextFillColor(ctx))
-                        .fixedSize()
-                }
-            }
+            // Context fill now lives per-row (right edge), tiered by urgency — the header
+            // stays a pure repo/branch group label.
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 2)   // a little breathing room between the label and its first row
         .frame(width: sheetWidth - 2 * kRowInset, height: kHeaderHeight, alignment: .bottomLeading)
-    }
-
-    // Context fill driving the active header's ring: the hovered row's session, else the
-    // selected one; falls back to the group's representative card.
-    private func headerContext(_ item: DropdownItem) -> Double? {
-        guard headerActive(item) else { return nil }
-        let group = String(item.id.dropFirst(4))   // strip "hdr:"
-        // Context is PER SESSION, but a header can span several sessions in one repo/branch group —
-        // showing one session's % under a multi-session label would misread as an aggregate. So only
-        // surface it when the group is a single session (then label ⇔ session, unambiguous).
-        let cards = state.roster.filter { $0.groupKey == group }
-        guard cards.count == 1 else { return nil }
-        return cards.first?.context
     }
 
     // Exactly ONE header is "active": the group under the cursor, or — when nothing's hovered —
@@ -1115,35 +1241,49 @@ struct IslandView: View {
                 .frame(width: 8)
                 .modifier(WobbleMarker(active: true))
         } else if status == "compacted" {
-            Image(systemName: "checkmark")
+            // Same static busy-glyph mark as "done", tinted the compact-blue instead of green.
+            Text("✻")
                 .font(.system(size: 11, weight: .bold))
                 .foregroundColor(IslandView.compact)
-                .frame(width: 8)
+                .frame(width: 11, height: 11)
         } else if status == "declined" {
             // A dismissed question/permission prompt — an "x" reads as "waved off".
             Image(systemName: "xmark")
                 .font(.system(size: 10, weight: .bold))
                 .foregroundColor(Color(white: 0.55))
-                .frame(width: 8)
+                .frame(width: 8, height: 8)
+                .frame(width: 11, height: 11)
         } else if status == "interrupted" {
             // A halted thinking/working turn — a stop square reads as "you stopped it".
             Image(systemName: "stop.fill")
                 .font(.system(size: 9, weight: .bold))
                 .foregroundColor(Color(white: 0.55))
-                .frame(width: 8)
+                .frame(width: 8, height: 8)
+                .frame(width: 11, height: 11)
         } else if status == "working" {
             BusyGlyph(color: IslandView.coral, interval: 0.20)
+        } else if status == "compacting" {
+            BusyGlyph(color: IslandView.compact, interval: 0.20)
         } else if status == "thinking" {
-            BusyGlyph(color: ultra ? IslandView.ultraRed : IslandView.amber, interval: 0.3)
+            if ultra {
+                UltraGlyph(interval: 0.3)
+            } else {
+                BusyGlyph(color: IslandView.amber, interval: 0.3)
+            }
         } else if status == "done" {
             // A finished turn reads as a static busy-glyph mark rather than a plain dot —
             // grey/idle stays a dot (see the fallback below).
             Text("✻")
                 .font(.system(size: 11, weight: .bold))
                 .foregroundColor(IslandView.green)
-                .frame(width: 8, height: 8)
+                .frame(width: 11, height: 11)   // matches BusyGlyph's max(size, 8) frame at size 11
+        } else if status == "idle" {
+            Circle().fill(Color.white.opacity(0.5)).frame(width: 7, height: 7).frame(width: 11, height: 11)
         } else {
-            Circle().fill(ultra ? IslandView.ultraRed : dotColor(status)).frame(width: 8, height: 8)
+            // Outer 11x11 box matches the glyph markers' footprint (BusyGlyph/done/UltraGlyph
+            // all frame at max(size, 8) = 11 by default) so the gap to the title stays
+            // consistent across every row, not just the dot's own 8pt size.
+            Circle().fill(dotColor(status)).frame(width: 8, height: 8).frame(width: 11, height: 11)
         }
     }
 
@@ -1201,7 +1341,11 @@ struct IslandView: View {
                 // then the tab title) so a follow-up message updates the row immediately
                 // instead of sticking to what kicked the session off.
                 let livePrompt = card.lastUserMsg.isEmpty ? card.firstPrompt : card.lastUserMsg
+                // "Compacted" rows lead with CC's own away-summary recap once it lands (see
+                // transcriptAwaySummary); until then they fall back to the same live-prompt text
+                // as an in-progress row.
                 let rowLabel = (isFinished || isEscTerminal || isError) ? (card.preview.isEmpty ? titleText : card.preview)
+                    : (card.status == "compacted" && !card.preview.isEmpty) ? card.preview
                     : ((kRowTitleUsesPrompt && !livePrompt.isEmpty) ? livePrompt : titleText)
                 let name = Text(rowLabel).foregroundColor(titleColor)
                 // Claude Code's own "waiting on background agents" status isn't exposed to
@@ -1210,9 +1354,13 @@ struct IslandView: View {
                 // always reads as "doing something" instead of going blank.
                 let workingVerb = card.verb.isEmpty && card.subagentCount > 0 ? "Waiting for subagents…" : card.verb
                 if card.status == "working", !workingVerb.isEmpty {
-                    verbRun(workingVerb + " ", color: IslandView.coral, ultra: false) + name
+                    verbRun(workingVerb + " ", color: IslandView.coral) + name
                 } else if card.status == "thinking" {
-                    verbRun(card.ultra ? "Ultrathinking… " : "Thinking… ", color: IslandView.amber, ultra: card.ultra) + name
+                    if card.ultra {
+                        RainbowVerb(text: "Ultrathinking… ", trailing: name)
+                    } else {
+                        verbRun("Thinking… ", color: IslandView.amber) + name
+                    }
                 } else if card.status == "compacting" {
                     Text("Compacting… ").font(.custom(kSerifFontName, size: 13)).tracking(0.5).foregroundColor(IslandView.compact) + name
                 } else if card.status == "compacted" {
@@ -1290,7 +1438,28 @@ struct IslandView: View {
                 .background(Capsule(style: .continuous).fill(IslandView.coral.opacity(0.16)))
                 .padding(.trailing, 3)
             }
-            // (Context ring moved to the group header — floated right as "ring + x% context".)
+            // Context-window fill, per session, floated just left of the timer. Tiered by
+            // urgency: below 30% it's inert and stays hidden; 30–50% is mild (amber) and only
+            // surfaces while the row is hovered, so quiet rows read clean; ≥50% is high enough
+            // to pin on always, in red. Color comes from contextFillColor. Skipped on the grey
+            // idle/stale rows, which carry no live context.
+            if card.status != "idle", card.status != "stale", card.context >= 0.30,
+               card.context >= 0.50 || hl {
+                HStack(spacing: 4) {
+                    ContextRing(pct: card.context)
+                    Text("\(Int((card.context * 100).rounded()))% context")
+                        .font(.custom(kSansFontName, size: 12))
+                        .foregroundColor(contextFillColor(card.context))
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                if !card.elapsed.isEmpty && !timerOnLeft {
+                    Text("·")
+                        .font(.custom(kSansFontName, size: 12))
+                        .foregroundColor(Color.white.opacity(0.55))
+                        .padding(.horizontal, 4)
+                }
+            }
             // Active rows keep the timer on the right; finished rows moved it to the left.
             if !card.elapsed.isEmpty && !timerOnLeft {
                 Text(card.elapsed)
@@ -1355,7 +1524,7 @@ struct IslandView: View {
     // so "done" reads green and "error" red even when they trail (matching the headline
     // palette); the rest is grey. When nothing actionable trails (all sessions running),
     // we fill the otherwise-blank right side with a hint — the fleet's dir-spread if it's
-    // spread across >1 project (more useful), else a plain "hover to see" affordance.
+    // spread across >1 project (more useful), else a plain "Hover to See" affordance.
     private struct AggPart { let text: String; let color: Color }
     private var aggParts: [AggPart] {
         let grey = Color(white: 0.62)
@@ -1366,7 +1535,7 @@ struct IslandView: View {
         if parts.isEmpty {
             let dirs = distinctProjectCount
             parts.append(dirs > 1 ? .init(text: "in \(dirs) dirs", color: grey)
-                                  : .init(text: "hover to see", color: grey))
+                                  : .init(text: "Hover to See", color: grey))
         }
         return parts
     }
@@ -1391,27 +1560,37 @@ struct IslandView: View {
     }
     // Right cluster: leading pad (3) + message text. The context ring now lives per-row in
     // the dropdown, so the front pill no longer draws it (would be redundant).
+    static let finishFlashLeadPad: CGFloat = 14
+    // Same leading pad whether or not the flash is CURRENTLY active, as long as we're in "done".
+    private var rightLeadPad: CGFloat { state.mode == .done ? IslandView.finishFlashLeadPad : 3 }
+    // The finish-flash marquees within a box sized to the TAB NAME it'll settle into — not a
+    // separate fixed width — specifically so `rightW` (and therefore `pillWidth`/`islandOffset`,
+    // the whole pill's position) is the SAME value for the entire "done" state: while the message
+    // is marqueeing, while it's mid-slide, and once it's settled to the plain tab name. A fixed
+    // marquee-comfortable width (the previous approach) necessarily differs from the tab name's
+    // real width, and that residual delta — not padding, not alignment, not animation timing —
+    // was the pixel jump: however carefully the swap itself is handled, two different box widths
+    // on either side of it will always show *some* gap. Same width throughout removes the gap
+    // instead of trying to hide it.
+    private var doneBoxWidth: CGFloat { textWidth(clip(state.title), IslandView.sansFont) }
     private var rightW: CGFloat {
-        3 + textWidth(rightText, IslandView.sansFont)
+        if state.mode == .done && !state.aggregate { return rightLeadPad + doneBoxWidth }
+        return rightLeadPad + textWidth(rightText, IslandView.sansFont)
     }
 
     private static let green = Color(red: 0.45, green: 0.82, blue: 0.52)
 
-    // Verb/label color matches the state.
-    // The leading verb run for a dropdown row — rainbow per-letter when the turn was an
-    // "ultrathink", else a flat status color. Serif + tracking to match the brand verb.
-    private func verbRun(_ text: String, color: Color, ultra: Bool) -> Text {
-        let base = ultra ? rainbowText(text) : Text(text).foregroundColor(color)
-        return base.font(.custom(kSerifFontName, size: 13)).tracking(0.5)
+    // Verb/label color matches the state. Serif + tracking to match the brand verb. (The
+    // "ultrathink" rainbow case is handled separately by RainbowVerb, which animates.)
+    private func verbRun(_ text: String, color: Color) -> Text {
+        Text(text).foregroundColor(color).font(.custom(kSerifFontName, size: 13)).tracking(0.5)
     }
 
     // The front pill's verb. Rainbow per-letter when a single (non-aggregate) ultrathink turn is
     // live; otherwise the flat status color with the sweeping white shimmer.
     @ViewBuilder private var primaryLabel: some View {
         if state.ultra && !state.aggregate && state.mode == .thinking {
-            rainbowText(primary)
-                .font(.custom(kSerifFontName, size: 13))
-                .tracking(0.5)
+            RainbowVerb(text: primary)
                 .lineLimit(1)
                 .fixedSize()
                 // Same white sweep as the flat verb — rides over the rainbow letters.
@@ -1455,6 +1634,12 @@ struct IslandView: View {
         guard m.count > IslandView.clipLen else { return m }
         return String(m.prefix(IslandView.clipLen)).trimmingCharacters(in: .whitespaces) + "…"
     }
+    // True while the front pill should show its just-finished flash (see `FinishFlash`) instead
+    // of the plain tab name. `justFinishedID` is set/cleared by the controller (rebuild()); the
+    // multi-second animation itself lives entirely in the view (see `island`/`FinishFlashView`).
+    private var showingFinishFlash: Bool {
+        state.mode == .done && !state.aggregate && state.justFinishedID != nil
+    }
 
     // Right side: live timer while thinking; a clip of Claude's message/action
     // while working, on done, and for permission prompts.
@@ -1466,8 +1651,8 @@ struct IslandView: View {
         // session's AI tab name (its directory until it's earned one) — a calmer "which convo",
         // matching the finished state below.
         case .working:                   return clip(state.title)
-        // Finished: the agent's reply already lives in the hover peek, so the right side shows the
-        // session's AI tab name (its directory until it's earned one) — a calmer "which convo".
+        // Finished: the agent's reply plays once via `FinishFlashView` (see `showingFinishFlash`);
+        // this plain-text fallback is only what shows before/after that flash.
         case .done:                      return clip(state.title)
         case .attention, .error:         return clip(state.preview)
         case .compacting, .compacted:    return ""
@@ -1504,17 +1689,44 @@ struct IslandView: View {
 
             // Right: message/timer (context ring moved to the dropdown rows).
             HStack(spacing: 7) {
-                if !rightText.isEmpty {
+                // `.transition(.identity)` on both branches: the ambient `.animation(value:
+                // pillWidth)` further down (pillWidth itself changes here, fixed flash width ⇄
+                // natural text width) would otherwise make SwiftUI's DEFAULT opacity crossfade
+                // kick in for this if/else's mount/unmount — a second, unwanted fade stacked on
+                // top of FinishFlashView's own already-completed slide, reading as a flash/blink
+                // right at the handoff. `.identity` means "swap instantly, no transition" —
+                // correct here since the view's own internal animation already did the work.
+                if showingFinishFlash {
+                    FinishFlashView(flash: finishFlash, width: doneBoxWidth, tabName: clip(state.title))
+                        .padding(.leading, IslandView.finishFlashLeadPad)
+                        .transition(.identity)
+                } else if !rightText.isEmpty {
                     rightTextView
                         .font(.custom(kSansFontName, size: 13))
                         .fontWeight(.regular)
                         .monospacedDigit()                  // tabular-nums: stable digit width
                         .lineLimit(1)
                         .fixedSize()
+                        .padding(.leading, rightLeadPad)
+                        .transition(.identity)
                 }
             }
-            .padding(.leading, 3)
             .frame(width: rightW, alignment: .trailing)
+        }
+        // Fires exactly once per fresh "done" arrival (see rebuild()'s edge-detection) — (re)starts
+        // the self-timed flash sequence. Reading state.preview/state.title here (not passed
+        // through justFinishedID) is safe: rebuild() sets them for the SAME session in the SAME
+        // pass right before flipping this.
+        .onChange(of: state.justFinishedID) { newValue in
+            guard newValue != nil else {
+                finishFlash.stop()   // controller cleared it (front moved on) — don't let a
+                return               // pending hold/slide timer fire pointlessly after the fact
+            }
+            finishFlash.start(message: state.preview) {
+                if IslandState.shared.justFinishedID != nil {
+                    IslandState.shared.justFinishedID = nil
+                }
+            }
         }
         .padding(.horizontal, 18)
         .frame(width: pillWidth, height: islandHeight)   // top row stays pinned to the notch
@@ -1579,7 +1791,9 @@ struct IslandView: View {
     @ViewBuilder
     private var usagePeekView: some View {
         let grey = Color(white: 0.55)
-        if !state.rlSession.isEmpty {
+        if state.firstRunHint {
+            Text("👋 Hover the notch anytime to summon me").foregroundColor(.white)
+        } else if !state.rlSession.isEmpty {
             let pct = Int(state.rlSession) ?? 0
             let barColor = pctColor(state.rlSession)
             let textColor = pctTextColor(state.rlSession)
@@ -1668,21 +1882,13 @@ struct IslandView: View {
         }
     }
 
-    @ViewBuilder private func icon(_ path: String, fallback: AnyView) -> some View {
-        if FileManager.default.fileExists(atPath: path) {
-            GIFView(path: path).frame(width: 18, height: 18).clipped()
-        } else {
-            fallback
-        }
-    }
-
     @ViewBuilder private var leading: some View {
         if state.aggregate {
             switch aggKind {
             case .needYou:
                 Image(systemName: "exclamationmark").font(.system(size: 13, weight: .bold)).foregroundColor(IslandView.red).frame(width: 14).modifier(WobbleMarker(active: true))
             case .running:
-                icon(kGifPath, fallback: AnyView(Spinner(accent: IslandView.coral, mode: .working)))
+                BusyGlyph(color: IslandView.coral, interval: 0.2, size: 17)
             case .done:
                 Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundColor(IslandView.green).frame(width: 18)
             case .error:
@@ -1696,7 +1902,11 @@ struct IslandView: View {
     @ViewBuilder private var leadingSingle: some View {
         switch state.mode {
         case .thinking:
-            BusyGlyph(color: state.ultra ? IslandView.ultraRed : accent, interval: 0.3, size: 17, pulse: true)
+            if state.ultra {
+                UltraGlyph(interval: 0.3, size: 17, pulse: true)
+            } else {
+                BusyGlyph(color: accent, interval: 0.3, size: 17, pulse: true)
+            }
         case .working:
             BusyGlyph(color: accent, interval: 0.2, size: 17)
         case .attention:
@@ -1706,22 +1916,23 @@ struct IslandView: View {
         case .done:
             Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundColor(accent).frame(width: 18)
         case .compacting:
-            icon(kCompactingGifPath, fallback: AnyView(Circle().fill(accent).frame(width: 9, height: 9).frame(width: 18)))
+            BusyGlyph(color: accent, interval: 0.25, size: 17)
         case .compacted:
             Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundColor(accent).frame(width: 18)
         case .idle:
-            // Resting "paused" Claude mark; falls back to a neutral glyph if the asset is missing.
-            // During the hover-hint stage it breathes (scale + opacity) to confirm the hover;
-            // once revealed in full it settles to a steady mark. A click briefly swaps it for
-            // the live working gif — a "still alive" wink — before settling back (idleWaking,
-            // toggled by handleIslandClick).
+            // Resting "paused" Claude mark: the static busy glyph. During the hover-hint stage
+            // it breathes (scale + opacity) to confirm the hover; once revealed in full it
+            // settles to a steady mark. A click plays one pass through the busy glyphs — a
+            // "still alive" wink — before settling back (idleWaking, toggled by
+            // handleIslandClick; purely cosmetic, doesn't focus/open anything).
             Group {
                 if state.idleWaking {
-                    icon(kGifPath, fallback: AnyView(Spinner(accent: accent, mode: .working)))
-                } else if FileManager.default.fileExists(atPath: kPausedImagePath) {
-                    GIFView(path: kPausedImagePath, animates: false).frame(width: 18, height: 18).clipped()
+                    IdleWakeGlyph(color: IslandView.coral, interval: 0.2, size: 17)
                 } else {
-                    Image(systemName: "pause.fill").font(.system(size: 11, weight: .semibold)).foregroundColor(accent).frame(width: 16)
+                    Text("✻")
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundColor(IslandView.coral)
+                        .frame(width: 17, height: 17)
                 }
             }
         }
@@ -1759,11 +1970,10 @@ struct ShimmerText: ViewModifier {
     }
 }
 
-/// Self-driving clock for the wobble. Like Ticker, we step time ourselves on a Timer:
-/// SwiftUI's own animation clock (TimelineView/withAnimation) doesn't tick reliably in
-/// this non-activating panel, and the global Ticker is STOPPED in attention mode — the
-/// one state the wobble needs — so the marker can't borrow its redraws. Each attention
-/// marker owns one; it only exists while that marker is on screen.
+/// Self-driving clock for the wobble: SwiftUI's own animation clock
+/// (TimelineView/withAnimation) doesn't tick reliably in this non-activating panel, so
+/// we step time ourselves on a Timer. Each attention marker owns one; it only exists
+/// while that marker is on screen.
 final class WobbleClock: ObservableObject {
     @Published var t: Double = 0
     private var timer: Timer?
@@ -1797,10 +2007,9 @@ struct WobbleMarker: ViewModifier {
 }
 
 /// Cycles a "working"/"thinking" row's marker through Claude Code's own busy
-/// glyphs (✳✽✶✢✻) instead of a static dot. Own timer per instance rather
-/// than borrowing `Ticker`: Ticker only runs while the FRONT session is
-/// thinking/working, so a background row stuck on "working" while the front
-/// session is elsewhere (e.g. attention) would otherwise never animate.
+/// glyphs (✳✽✶✢✻) instead of a static dot. Own timer per instance so a
+/// background row stuck on "working" animates independently of whatever the
+/// front session is doing (e.g. attention).
 final class GlyphClock: ObservableObject {
     @Published var t: Double = 0   // continuously running elapsed time, in seconds
     private var timer: Timer?
@@ -1848,32 +2057,59 @@ struct BusyGlyph: View {
     }
 }
 
-struct Spinner: View {
-    let accent: Color
-    let mode: IslandState.Mode
-    @ObservedObject private var ticker = Ticker.shared
+/// The idle "wake" wink: plays exactly one pass through the busy glyphs, then holds on the
+/// last one (clamped, not modulo — unlike `BusyGlyph` this never loops) so it reads as a
+/// single "still alive" blink instead of spinning for as long as `idleWaking` happens to
+/// stay true.
+struct IdleWakeGlyph: View {
+    let color: Color
+    let interval: Double
+    let size: CGFloat
+    @StateObject private var clock = GlyphClock()
+
+    private var frame: Int { min(Int(clock.t / interval), BusyGlyph.glyphs.count - 1) }
 
     var body: some View {
-        Group {
-            switch mode {
-            case .done:
-                Image(systemName: "checkmark")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(accent)
-            case .attention:
-                Image(systemName: "exclamationmark")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundColor(accent)
-                    .modifier(WobbleMarker(active: true))
-            default:
-                Circle()
-                    .trim(from: 0, to: 0.7)
-                    .stroke(accent, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                    .frame(width: 12, height: 12)
-                    .rotationEffect(.degrees(ticker.angle))
-            }
-        }
-        .frame(width: 14, height: 14)
+        Text(BusyGlyph.glyphs[frame])
+            .font(.system(size: size, weight: .bold))
+            .foregroundColor(color)
+            .frame(width: max(size, 8), height: max(size, 8))
+    }
+}
+
+/// The marker for an "ultrathink" turn: the same cycling busy glyphs as `BusyGlyph`, but
+/// colored to continuously track the rainbow verb's leading (character 0) hue instead of a
+/// fixed color — kept in exact sync via the shared `RainbowClock`, since the verb text and
+/// this glyph are separate views that both need to move together. A dedicated small view
+/// (rather than adding this to `BusyGlyph` itself) so the extra 60Hz re-render this needs
+/// stays scoped to actual ultrathink markers, not every plain working/thinking dot.
+struct UltraGlyph: View {
+    let interval: Double
+    let size: CGFloat
+    let pulse: Bool
+    @StateObject private var clock = GlyphClock()
+    @ObservedObject private var rainbowClock = RainbowClock.shared
+
+    init(interval: Double, size: CGFloat = 11, pulse: Bool = false) {
+        self.interval = interval
+        self.size = size
+        self.pulse = pulse
+    }
+
+    private var frame: Int { Int(clock.t / interval) % BusyGlyph.glyphs.count }
+    private var pulseOpacity: Double { 0.925 + 0.075 * cos(2 * Double.pi * clock.t / interval) }
+    private var color: Color {
+        // Character 0's current slot — matches the leading letter of the rainbow verb.
+        let step = Int(rainbowClock.t / RainbowClock.swapInterval)
+        return kRainbowPalette[rainbowSlot(0, step: step)]
+    }
+
+    var body: some View {
+        Text(BusyGlyph.glyphs[frame])
+            .font(.system(size: size, weight: .bold))
+            .foregroundColor(color)
+            .opacity(pulse ? pulseOpacity : 1.0)
+            .frame(width: max(size, 8), height: max(size, 8))
     }
 }
 
@@ -2018,6 +2254,73 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var sheetSide: CGFloat { IslandState.shared.mode == .idle ? 0 : kSheetSide }
     private var mouseMonitors: [Any] = []
 
+    // MARK: - Menu bar item (Pause / Quit)
+
+    private var statusItem: NSStatusItem?
+    private var pauseMenuItem: NSMenuItem?
+    private var paused = false
+
+    /// A menu bar presence — the conventional home for quitting a background utility (a plain
+    /// Quit would just be relaunched by the KeepAlive agent) and a persistent "it's installed"
+    /// anchor. The glyph is a mini-notch: the island's own concave shoulder fillets.
+    private func setupStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = notchGlyph()
+        item.button?.toolTip = "Claude Island"
+        let menu = NSMenu()
+        let pause = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
+        pause.target = self
+        menu.addItem(pause)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit Claude Island", action: #selector(quitIsland), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+        item.menu = menu
+        statusItem = item
+        pauseMenuItem = pause
+    }
+
+    /// The notch silhouette as a menu bar template image — the same concave re-entrant shoulder
+    /// fillets as `IslandShape`, so the glyph reads as "the notch thing." Template → macOS tints
+    /// it for the light/dark menu bar automatically.
+    private func notchGlyph() -> NSImage {
+        // The island silhouette itself — concave re-entrant shoulder fillets on top, convex
+        // bottom corners (same geometry as `IslandShape`). A tad shorter than the original so it
+        // reads as a wide notch. Template → macOS tints it for the light/dark menu bar.
+        let w: CGFloat = 22, h: CGFloat = 10.5, r: CGFloat = 5, br: CGFloat = 3
+        let img = NSImage(size: NSSize(width: w, height: h), flipped: true) { _ in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            let p = CGMutablePath()   // flipped:true → top-left origin, y down, matching IslandShape
+            p.move(to: CGPoint(x: 0, y: 0))
+            p.addLine(to: CGPoint(x: w, y: 0))
+            p.addQuadCurve(to: CGPoint(x: w - r, y: r), control: CGPoint(x: w - r, y: 0))       // right shoulder (concave)
+            p.addLine(to: CGPoint(x: w - r, y: h - br))
+            p.addQuadCurve(to: CGPoint(x: w - r - br, y: h), control: CGPoint(x: w - r, y: h))  // bottom-right convex
+            p.addLine(to: CGPoint(x: r + br, y: h))
+            p.addQuadCurve(to: CGPoint(x: r, y: h - br), control: CGPoint(x: r, y: h))          // bottom-left convex
+            p.addLine(to: CGPoint(x: r, y: r))
+            p.addQuadCurve(to: CGPoint(x: 0, y: 0), control: CGPoint(x: r, y: 0))               // left shoulder (concave)
+            p.closeSubpath()
+            ctx.addPath(p); NSColor.black.setFill(); ctx.fillPath()
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }
+
+    @objc private func togglePause() {
+        paused.toggle()
+        pauseMenuItem?.title = paused ? "Resume" : "Pause"
+        if paused { panel.orderOut(nil) } else { rebuild() }
+    }
+
+    @objc private func quitIsland() {
+        // KeepAlive=true would relaunch a plain terminate, so bootout the LaunchAgent — it stays
+        // quit until next login (or a reinstall / manual `launchctl bootstrap`).
+        _ = shell("/bin/launchctl", ["bootout", "gui/\(getuid())/com.claude-island.app"])
+        NSApp.terminate(nil)
+    }
+
     func applicationDidFinishLaunching(_ note: Notification) {
         AppController.shared = self
         registerFonts()
@@ -2042,6 +2345,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel = NotchPanel()
         panel.contentView = hosting
         position()
+        setupStatusItem()
 
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         CFNotificationCenterAddObserver(center,
@@ -2114,6 +2418,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// Hit-test the mouse against the back-card slivers and update the hovered card.
     /// Runs on the main thread (NSEvent monitors fire there).
     private func updateHover() {
+        if paused { return }                          // no hover reveals while paused
         let p = NSEvent.mouseLocation                 // screen coords, origin bottom-left
         let f = panel.frame
         let s = IslandState.shared
@@ -2137,7 +2442,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     }
                     if s.frontHovered != overNotch { setFrontHover(overNotch) }   // stats strip on notch hover only
                     if !s.dropdownOpen {
-                        if pointInFrontPill(p) && !overNotch { openDropdown() }
+                        if pointInFrontPillRight(p) && !overNotch { openDropdown() }
                     } else if !overIsland {
                         closeDropdown()
                     }
@@ -2184,7 +2489,10 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         // Front-pill peek: the notch peek, or a single (non-aggregate) session's title on
         // hover. The aggregate never title-peeks — every count routes to the dropdown instead.
-        let front = !s.dropdownOpen && (overNotch || (!s.aggregate && pointInFrontPill(p)))
+        // Idle never title-peeks either — there's no title/preview to show (peekText is forced
+        // empty), so hovering the resting icon must not expand a strip with nothing in it; only
+        // the notch itself still peeks (the usage stats), same as every other mode.
+        let front = !s.dropdownOpen && (overNotch || (!s.aggregate && s.mode != .idle && pointInFrontPill(p)))
         if s.frontHovered != front { setFrontHover(front) }
         // Run the marquee clock only while the session-message peek is up (not the static
         // notch peek) — it's a real run-loop timer, so don't leave it spinning idle.
@@ -2203,7 +2511,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     } else if let b = bucket {
                         s.dropdownFilter = b
                         openDropdown()
-                    } else if s.mode == .idle && s.neutralNotIdle && pointInFrontPill(p) && !overNotch {
+                    } else if s.mode == .idle && s.neutralNotIdle && pointInFrontPillRight(p) && !overNotch {
                         // The dismissed-neutral "{n} sessions" pill has no "{n} ⌄" back-peek
                         // (suppressed for .idle mode, same as the hidden-idle pill) — hovering
                         // the pill itself opens the dropdown directly instead.
@@ -2341,6 +2649,34 @@ final class AppController: NSObject, NSApplicationDelegate {
         s.idleReveal = 0          // collapsed; springs to 1 on the hover-reveal
         (curPillWidth, curIslandOffset) = idleGeom(primary: "", right: idleRightLabel())
         panel.orderOut(nil)
+        maybeShowFirstRunHint()   // first idle after install → teach the hover, once
+    }
+
+    private var firstRunHintChecked = false
+    /// The first time the island goes idle after install, briefly reveal the resting pill with a
+    /// "hover to summon me" note in the peek strip — so the hover affordance is discoverable
+    /// instead of the notch just going dark. Shown once, then a flag file suppresses it forever.
+    private func maybeShowFirstRunHint() {
+        guard !firstRunHintChecked else { return }
+        firstRunHintChecked = true
+        let flag = kEventDir + "/.onboarded"
+        if FileManager.default.fileExists(atPath: flag) { return }
+        let s = IslandState.shared
+        s.firstRunHint = true
+        showIdleHint()            // orders the pill front + reveals it
+        cancelIdleDwell()         // skip the hint→settle dwell; go straight to the full pill
+        s.idleHint = false
+        s.notchPeek = true        // select the usage-peek slot (firstRunHint swaps in the teach copy)
+        setFrontHover(true)       // grow the peek strip so the copy has room
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+            guard let self else { return }
+            let s = IslandState.shared
+            s.firstRunHint = false   // clear BEFORE hiding so the hideIdlePeek guard lets it tear down
+            s.notchPeek = false
+            self.setFrontHover(false)
+            self.hideIdlePeek()
+            try? "1\n".write(toFile: flag, atomically: true, encoding: .utf8)
+        }
     }
 
     /// The idle pill's right-side label — mirrors IslandView's `.idle` rightText case.
@@ -2376,7 +2712,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         // and plays the bouncy entrance.
         DispatchQueue.main.async { IslandState.shared.idleReveal = 1 }
         idleHoverTimer?.invalidate()
-        let t = Timer(timeInterval: 1.0, repeats: false) { [weak self] _ in
+        let t = Timer(timeInterval: 0.4, repeats: false) { [weak self] _ in
             self?.expandIdlePeek()
         }
         RunLoop.main.add(t, forMode: .common)
@@ -2399,6 +2735,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func hideIdlePeek() {
+        // The first-run teaching peek holds itself up for its full window regardless of the
+        // cursor; it clears firstRunHint before hiding, so this guard only blocks mid-show.
+        if IslandState.shared.firstRunHint { return }
         idlePeekShown = false
         cancelIdleDwell()
         IslandState.shared.idleHint = false
@@ -2436,15 +2775,38 @@ final class AppController: NSObject, NSApplicationDelegate {
         return p.x >= left && p.x <= right && p.y >= bottom && p.y <= f.maxY
     }
 
+    /// The idle pill's right side ONLY — everything past the leading icon. Hovering the
+    /// "{n} sessions" / "{n} idle sessions" count text opens the dropdown; hovering the icon
+    /// itself must not (it's just the resting mark). `island`'s HStack has an outer
+    /// `.padding(.horizontal, 18)` before the icon even starts, THEN the 18pt icon slot
+    /// (`leadingSlot`, no verb text next to it in .idle) — both have to be skipped, not just
+    /// one (that was the bug: skipping only 18 landed inside the padding, still over the icon).
+    private func pointInFrontPillRight(_ p: NSPoint) -> Bool {
+        let s = IslandState.shared
+        let f = panel.frame
+        let islandH = max(s.notchHeight, 30)
+        let center = f.midX + curIslandOffset
+        let outerPadding: CGFloat = 18
+        let leadingSlot: CGFloat = 18
+        let left = center - curPillWidth / 2 + outerPadding + leadingSlot
+        let right = center + curPillWidth / 2
+        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
+        return p.x >= left && p.x <= right && p.y >= bottom && p.y <= f.maxY
+    }
+
     /// True over the literal notch — its own width, centered on the screen (the physical
     /// notch sits at the panel's horizontal center regardless of the pill's offset). Drives
     /// the "Happy Clauding" peek; extends down with the peek strip so the hover holds.
     private func pointInNotchRegion(_ p: NSPoint) -> Bool {
         let s = IslandState.shared
         let f = panel.frame
+        // The literal notch strip only — its original (un-expanded) height, even while the
+        // peek below it is showing. Otherwise hovering anywhere in the expanded peek area,
+        // including its bottom edge, would count as "on the notch" and swap the title/preview
+        // peek for the session-limit one.
         let islandH = max(s.notchHeight, 30)
         let halfW = max(s.notchWidth, 120) / 2
-        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
+        let bottom = f.maxY - islandH
         return abs(p.x - f.midX) <= halfW && p.y >= bottom && p.y <= f.maxY
     }
 
@@ -2472,7 +2834,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
     // Trailing counts as (text, bucket), in the order IslandView draws them. The hint
-    // ("in N dirs" / "hover to see") carries the headline bucket, so the whole single-bucket
+    // ("in N dirs" / "Hover to See") carries the headline bucket, so the whole single-bucket
     // pill resolves to that one bucket.
     private func aggRightParts() -> [(text: String, bucket: String)] {
         let s = IslandState.shared
@@ -2483,7 +2845,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         if head != "error",   s.errorCount   > 0 { parts.append(("\(s.errorCount) error", "error")) }
         if parts.isEmpty {
             let d = distinctProjects()
-            parts.append((d > 1 ? "in \(d) dirs" : "hover to see", head))
+            parts.append((d > 1 ? "in \(d) dirs" : "Hover to See", head))
         }
         return parts
     }
@@ -2674,9 +3036,22 @@ final class AppController: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let live = self.computeLiveTabs()
             let warpTab = hidden ? nil : self.warpActiveTab()   // skip Warp's sqlite read when hidden (no UI)
+            // CC's own busy/idle read — unlike pollLiveStatus (which only ever flips to
+            // "interrupted" once CC itself reports idle), this scan otherwise trusts the
+            // transcript tail alone. A mid-turn interrupt-and-resume (Esc, or answering a
+            // question) writes the "Request interrupted by user" marker before the resumed
+            // real content streams back in, so a thinking/working session can transiently
+            // read as abandoned while CC is still actively computing the resume. Cross-check
+            // busy status here too so this slower (4s) backstop can't flip an actually-busy
+            // session — pollLiveStatus (0.6s) already owns that transition correctly.
+            let statuses = self.ccSessionStatuses()
             var interrupted = Set<String>()
             var declinedPreview: [String: String] = [:]
-            for (uuid, _, tx) in active where !tx.isEmpty {
+            for (uuid, mode, tx) in active where !tx.isEmpty {
+                if mode != "attention" {
+                    let sessionId = ((tx as NSString).lastPathComponent as NSString).deletingPathExtension
+                    if statuses[sessionId] == "busy" { continue }
+                }
                 if self.transcriptInterrupted(tx) {
                     interrupted.insert(uuid)
                     // The agent's response so far, shown in white on the declined row.
@@ -2894,12 +3269,13 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func rebuild() {
+        if paused { panel.orderOut(nil); return }   // Pause: stay dark until resumed
         IslandState.shared.neutralNotIdle = false   // only the dismissed-front branch below sets this
         let suppress = staleDuplicateTabs()
         let vis = visibleSessions(suppressing: suppress)
         guard !vis.isEmpty else {
             frontUUID = nil
-            Ticker.shared.stop(); stopClock()
+            stopClock()
             // No state-file session is live — but Warp tabs running claude with no file (idle,
             // or file cleared) may still be open. Surface them as "{n} idle sessions" + a hover
             // list, exactly like stale ones, instead of collapsing to a bare "Idle".
@@ -3008,6 +3384,11 @@ final class AppController: NSObject, NSApplicationDelegate {
                 ?? selectionVis.max(by: { ($0.value.promptTs, $0.value.ts) < ($1.value.promptTs, $1.value.ts) })?.key
                 ?? selectionVis.keys.sorted().first!
         }
+        // Captured before frontUUID/state.mode below are overwritten — lets the finish-flash
+        // trigger further down tell "just arrived at done" apart from "still sitting at done".
+        let prevFrontUUID = frontUUID
+        let prevMode = IslandState.shared.mode
+
         frontUUID = front
         let f = vis[front]!
         // A delegating front shows live "Delegating…" rather than its parked done state.
@@ -3135,19 +3516,22 @@ final class AppController: NSObject, NSApplicationDelegate {
         if orderGrew { try? projectOrder.joined(separator: "\n").write(toFile: kProjectOrderFile, atomically: true, encoding: .utf8) }
         rebuildDropdownItems()
 
-        // Spinner follows the front session.
-        switch state.mode {
-        case .thinking, .working: Ticker.shared.start()
-        case .done:
-            Ticker.shared.stop()
+        if state.mode == .done {
             state.elapsed = formatElapsed(f)        // frozen total
-        case .attention, .error, .compacting, .compacted, .idle: Ticker.shared.stop()
         }
         // The 1s clock runs while ANY visible session is mid-turn, so every active row's
         // timer in the dropdown ticks live — not just the front pill's.
         // Delegating sessions (parent done, subagent still live) count as active too — otherwise
         // the clock/poll stops and the overlay never re-evaluates when the delegate finishes.
-        let anyActive = vis.contains { $0.value.mode == "working" || $0.value.mode == "thinking" || delegating.contains($0.key) }
+        // A freshly-compacted session also counts, but only for a short grace window: CC's own
+        // "away summary" recap (see transcriptAwaySummary) lands a little after the compact
+        // finishes, not synchronously with it, so the poll needs to keep checking for a bit —
+        // but NOT forever, or an old untouched "Compacted" row would wake the CPU ~2×/sec
+        // indefinitely just waiting for a recap that already came (or is never coming).
+        let anyActive = vis.contains {
+            $0.value.mode == "working" || $0.value.mode == "thinking" || delegating.contains($0.key)
+                || ($0.value.mode == "compacted" && now - $0.value.ts < 300)
+        }
         // The 1s timer and the sub-second live poll both run ONLY while a turn is active.
         if anyActive { startClock(); startLivePoll() } else { stopClock(); stopLivePoll() }
 
@@ -3170,9 +3554,25 @@ final class AppController: NSObject, NSApplicationDelegate {
         // the front for its full live activity (then show that, not the counts).
         state.aggregate = !allFrontsDismissed && !focusedRunning && !focusedDone && (running + needYou + done + errored) >= 2
 
+        // A single front session just landed at "done" (not merely still sitting there from a
+        // prior rebuild) → tell the view to (re)start its finish-flash (see `FinishFlash`) by
+        // setting this to a fresh value; the view's `.onChange` does the rest and nils it back
+        // out itself once the flash hands off to the tab name. Cleared here the instant it no
+        // longer applies (front moved on, or this session started a new turn) so the NEXT fresh
+        // "done" for the very same session — same uuid string — still reads as a value change.
+        // NOTE: don't wrap these in withTransaction(animation: nil) — this runs synchronously
+        // inside openDropdown() (dropdownOpen=true; rebuild()), and forcing a "no animation"
+        // transaction here suppressed the dropdown's OWN open animation too (both land in the
+        // same update pass), making the whole island snap open instead of springing.
+        if state.mode == .done, !state.aggregate, !state.preview.isEmpty,
+           (front != prevFrontUUID || prevMode != .done) {
+            state.justFinishedID = front
+        } else if state.mode != .done || state.aggregate {
+            state.justFinishedID = nil
+        }
+
         // Nothing live, waiting, or errored (all stale / idle) → hide the island entirely.
         if running + needYou + done + errored == 0 {
-            Ticker.shared.stop()
             // Genuinely nothing left (even the dismissed session has gone stale) — this is the
             // real idle regime, not the dismissed-neutral one, so it always reads "idle
             // sessions" regardless of the override above.
@@ -3348,6 +3748,30 @@ final class AppController: NSObject, NSApplicationDelegate {
         return nil
     }
 
+    /// A "compacted" row has nothing better than the pre-compact prompt to show until CC's own
+    /// "away summary" recap lands — a plain-English catch-up ("Prepping X, just finished Y,
+    /// waiting on Z") CC injects as a `system`/`away_summary` entry the next time you return to
+    /// the session. It doesn't fire synchronously at compaction, only on that later touch, so
+    /// this returns nil until then and the row keeps its current fallback. A generous tail
+    /// window (unlike the 8K used elsewhere) since a few bulky tool/attachment entries can sit
+    /// between the compact boundary and the recap.
+    private func transcriptAwaySummary(_ path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        let size = fh.seekToEndOfFile()
+        fh.seek(toFileOffset: size > 32_768 ? size - 32_768 : 0)
+        guard let s = String(data: fh.readDataToEndOfFile(), encoding: .utf8) else { return nil }
+        for line in s.split(separator: "\n").reversed() {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  obj["type"] as? String == "system",
+                  obj["subtype"] as? String == "away_summary",
+                  let content = obj["content"] as? String, !content.isEmpty else { continue }
+            return content
+        }
+        return nil
+    }
+
     /// Rewrite a session file to a terminal Esc state: "declined" (an Esc'd question/permission
     /// prompt) or "interrupted" (a halted thinking/working turn), clearing any dead question and
     /// parking the agent's response so far as the preview. Persisting it means reload()/merge()
@@ -3490,10 +3914,12 @@ final class AppController: NSObject, NSApplicationDelegate {
             var acts: [String: (preview: String, verb: String, thinking: Bool)] = [:]
             var interrupted = Set<String>()
             var apiErrors: [String: String] = [:]
+            var awaySummaries: [String: String] = [:]
             for (uuid, _, tx) in snap {
                 if let a = self.transcriptActivity(tx) { acts[uuid] = a }
                 if self.transcriptInterrupted(tx) { interrupted.insert(uuid) }
                 if let e = self.transcriptApiError(tx) { apiErrors[uuid] = e }
+                if let away = self.transcriptAwaySummary(tx) { awaySummaries[uuid] = away }
             }
             DispatchQueue.main.async {
                 var changed = false
@@ -3543,11 +3969,17 @@ final class AppController: NSObject, NSApplicationDelegate {
                             changed = true
                         }
                     }
+                    // A "compacted" row has no preview of its own until CC's own "away summary"
+                    // recap lands (see transcriptAwaySummary) — swap it in over the pre-compact
+                    // prompt fallback once it shows up.
+                    if s.mode == "compacted", let away = awaySummaries[uuid], !away.isEmpty, s.preview != away {
+                        s.preview = away; changed = true
+                    }
                     // Freshest preview while live (cheap; no-op when unchanged). Skip the Esc
-                    // terminal states and error — their preview is the frozen question /
-                    // response-so-far / error message, which the transcript tail would otherwise
-                    // overwrite with a stale action.
-                    if s.mode != "declined", s.mode != "interrupted", s.mode != "error",
+                    // terminal states, error, and compacted — their preview is the frozen question /
+                    // response-so-far / error message / away-summary, which the transcript tail
+                    // would otherwise overwrite with a stale pre-compact action.
+                    if s.mode != "declined", s.mode != "interrupted", s.mode != "error", s.mode != "compacted",
                        let p = acts[uuid]?.preview, !p.isEmpty, s.preview != p { s.preview = p; changed = true }
                 }
                 if changed { self.rebuild() }
@@ -3702,16 +4134,33 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// Front-pill click: focus its Warp tab; if it's done, dismiss that card.
     func handleIslandClick() {
         let s = IslandState.shared
-        // A little "still alive" wink on the resting mark: briefly swap it for the live
-        // working gif, then settle back. Purely cosmetic — doesn't change what the click does.
-        if s.mode == .idle && !s.idleWaking {
-            s.idleWaking = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { IslandState.shared.idleWaking = false }
+        // A little "still alive" wink on the resting mark: play one pass through the busy
+        // glyphs, then settle back. Purely cosmetic, and idle has nothing actionable to jump
+        // to, so this is also the ENTIRE click behavior while idle — never focuses/opens a
+        // Warp/terminal tab (unlike every other mode below).
+        if s.mode == .idle {
+            if !s.idleWaking {
+                s.idleWaking = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { IslandState.shared.idleWaking = false }
+            }
+            // Persistent "{n} idle sessions" pill: a click still toggles its dropdown — never
+            // focuses/dismisses a session (there's no meaningful "front" while everything's idle).
+            if hiddenIdle && s.idleSessionCount >= 1 {
+                if s.dropdownOpen { closeDropdown() } else { openDropdown() }
+            }
+            return
         }
-        // Persistent "{n} idle sessions" pill: a click just toggles its dropdown — never
-        // focuses/dismisses a session (there's no meaningful "front" while everything's idle).
-        if hiddenIdle && s.mode == .idle && s.idleSessionCount >= 1 {
-            if s.dropdownOpen { closeDropdown() } else { openDropdown() }
+        // On the aggregate pill, clicking while hovering the "{n} done" count (dropdownFilter
+        // already tracks whichever bucket is under the cursor, set by the hover monitor) clears
+        // it the same way the single-session "Finished" pill does — dismiss every done/declined/
+        // interrupted/compacted session so the count (and, once nothing else is running, the
+        // whole aggregate) drops away instead of jumping to some arbitrary tab.
+        if s.aggregate, s.dropdownFilter == "done" {
+            let doneFamily: Set<String> = ["done", "declined", "interrupted", "compacted"]
+            for card in s.roster where doneFamily.contains(card.status) { dismissedDoneIds.insert(card.id) }
+            s.dropdownFilter = ""
+            if s.dropdownOpen { refilterOpenDropdown() }
+            rebuild()
             return
         }
         // A "Finished" single-session pill: click just acknowledges it — reset to the neutral

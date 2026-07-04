@@ -29,6 +29,29 @@ let kDarwinName = "com.claude-island.event"
 // false to revert to the tab title. (Falls back to the title when no prompt was captured.)
 let kRowTitleUsesPrompt = true
 
+private func stableKeyHash(_ s: String) -> String {
+    var hash: UInt64 = 0xcbf29ce484222325
+    for b in s.utf8 {
+        hash ^= UInt64(b)
+        hash = hash &* 0x100000001b3
+    }
+    return String(format: "%016llx", hash)
+}
+
+private func normalizedFlashText(_ s: String) -> String {
+    s.trimmingCharacters(in: .whitespacesAndNewlines)
+        .split { $0.isWhitespace || $0.isNewline }
+        .joined(separator: " ")
+}
+
+private func transcriptEventID(_ obj: [String: Any], fallback: String) -> String {
+    for key in ["uuid", "id", "timestamp"] {
+        if let s = obj[key] as? String, !s.isEmpty { return s }
+        if let n = obj[key] as? NSNumber { return n.stringValue }
+    }
+    return stableKeyHash(fallback)
+}
+
 // Custom fonts (registered at launch). Verb uses the serif, project uses the sans.
 let kSerifFontPath = NSString("~/Library/Fonts/AnthropicSerif_Roman_Web-s.p.0974051x8mlf0.otf").expandingTildeInPath
 let kSansFontPath  = NSString("~/Library/Fonts/AnthropicSans_Roman_Web-s.p.0g0iw7wqvowb5.otf").expandingTildeInPath
@@ -125,6 +148,7 @@ let kCardTextPad: CGFloat = 22    // title leading inset (clears the concave sho
 let kCardTextGap: CGFloat = 8     // gap after the title before the tuck
 let kCardSansFont = NSFont(name: kSansFontName, size: 13) ?? .systemFont(ofSize: 13)
 let kTimerFont = NSFont(name: kSansFontName, size: 12) ?? .systemFont(ofSize: 12)  // dropdown row timer
+let kTooltipFont = NSFont(name: kSansFontName, size: 11) ?? .systemFont(ofSize: 11) // compactTooltip label
 
 // Dropdown ("{n} ⌄") UI geometry, shared by the view and the controller's hit-testing.
 let kAgentsPeek: CGFloat = 32     // how far the "{n} ⌄" back pill peeks past the pill's right edge
@@ -132,6 +156,19 @@ let kSheetSide: CGFloat = 40      // how much wider (each side) the expanded she
 let kRowHeight: CGFloat = 32      // dropdown row height
 let kSubagentFreshS: Double = 8   // a subagent whose transcript moved within this window is "running"
 let kHeaderHeight: CGFloat = 22   // dropdown section-header (project label) height
+let kFlashHoldS: Double = 7.0      // front-pill commentary flash: how long a PROSE flash holds
+                                   // before it slides back to the tab name (matches FinishFlash's
+                                   // timer); also its protected window before anything replaces it
+let kProseRefreshS: Double = 1.6    // minimum read before newer prose can refresh older prose
+let kToolDwellS: Double = 1.2      // shorter protected window for a tool-label flash — long enough
+                                   // that a burst of rapid tool calls coalesces instead of flickering
+let kLivePollIntervalS: Double = 0.4       // active-turn transcript/status poll; cheap after one-pass tailing
+let kLivePollToleranceS: Double = 0.08
+let kLivenessInspectIntervalS: Double = 1.0 // dropdown/idle-pill visible: user is actively inspecting
+let kLivenessActiveIntervalS: Double = 2.0  // normal visible active/resting island
+let kLivenessHiddenIntervalS: Double = 20.0 // fully hidden idle: save CPU
+let kLiveTabGraceDefaultS: Double = 8.0     // smooth one missed ps scan in the background
+let kLiveTabGraceInspectS: Double = 3.0     // faster disappear while the roster is visible
 let kDropdownVPad: CGFloat = 6    // vertical padding below the pill row, inside the sheet
 let kDropdownBottomPad: CGFloat = 6   // padding below the last row, inside the rounded bottom
 let kRowInset: CGFloat = 14       // row horizontal inset from the sheet edge
@@ -169,16 +206,25 @@ func neutralSessionsLabel(_ n: Int) -> String {
 }
 
 /// Whether a row draws a context ring (shared by the view and the controller's hit-test):
-/// only once the window is ≥25% full, and never on the grey idle/stale rows.
+/// only once the window is ≥25% full. Shown on every status, including the grey
+/// idle/stale rows — those are exactly the tabs you're about to resume typing into,
+/// so their fill is worth knowing before you do, arguably more than a busy row's.
 func ringVisible(_ card: SessionCard) -> Bool {
-    card.context >= 0.25 && card.status != "idle" && card.status != "stale"
+    card.context >= 0.25
 }
 
-/// Context-ring fill (and the matching "x% context" text) — warns as the window fills:
-/// white < 30%, amber 30–50%, red > 50%.
+/// Context badge fill — warns as the window fills: white < 30%, amber 30–50%, red ≥ 50%.
 func contextFillColor(_ pct: Double) -> Color {
-    if pct > 0.5  { return Color(red: 0.898, green: 0.282, blue: 0.302) }  // red
+    if pct >= 0.5 { return Color(red: 0.898, green: 0.282, blue: 0.302) }  // red
     if pct > 0.30 { return Color(red: 1.0, green: 0.745, blue: 0.0) }      // amber
+    return .white
+}
+
+/// Context badge foreground (ring + percent text) — the amber fill is too light for white
+/// to stay legible, so that band alone flips to black; red and the white/base fill keep white.
+func contextForegroundColor(_ pct: Double) -> Color {
+    if pct >= 0.5 { return .white }
+    if pct > 0.30 { return .black }
     return .white
 }
 
@@ -224,6 +270,21 @@ final class IslandState: ObservableObject {
     // slide out to the tab name) is fully owned and self-timed by `FinishFlash` in the view — see
     // its doc comment for why this can't be a normal SwiftUI `.animation`.
     @Published var justFinishedID: String? = nil     // frontUUID whose flash should be (re)triggered
+
+    // A working front session just said something (genuine commentary, not a tool-label
+    // fallback — see `commentary` on SessionCard/LiveSession) briefly shows it in the
+    // right-side slot the same way `justFinishedID` does for the done reply, so a glance at
+    // the pill answers "is it stuck?" without needing to hover-peek. Set to a fresh, distinct
+    // value (see rebuild()'s edge-detection) each time NEW commentary lands; read alongside
+    // `preview` (already the current front's text by the time this flips, same reasoning as
+    // `justFinishedID`) and cleared by the view once its own hold+slide sequence completes.
+    @Published var freshCommentaryID: String? = nil
+    // The exact message the current flash should show — captured in rebuild() at trigger time,
+    // NOT re-read from `preview` when the flash starts. `preview` moves on (a later tool event,
+    // or the turn's done boundary) between the trigger and the view's async `.onChange`, so
+    // reading it late showed a message that didn't match what triggered the flash (phantom
+    // text). This pins the shown message to the triggering one.
+    @Published var commentaryMessage: String = ""
 
     // ── Multi-session aggregate (≥2 sessions that have actually run) ─────────────
     // Past one session the front pill stops narrating a single tab and shows fleet
@@ -389,6 +450,8 @@ struct SessionCard: Identifiable {
     var elapsed: String = "" // turn timer text; live while active, frozen when done
     var context: Double = 0  // 0…1 context-window fill, for the per-row ring
     var preview: String = "" // latest action / message, shown grey after the title
+    var flashPri: Int = 0    // how much `preview` should flash: 2 prose / 1 notable action / 0 routine
+    var flashKey: String = "" // transcript-stable identity for `preview`; text itself is display-only
     var firstPrompt: String = "" // session's opening user message (row-title experiment)
     var lastUserMsg: String = "" // session's most recent user message, for the dropdown row title
     var qHeader: String = ""  // pending AskUserQuestion: short topic label (attention rows)
@@ -450,6 +513,9 @@ struct SessionFile: Decodable {
     let qHeader: String?       // pending AskUserQuestion: short topic label (e.g. "Card tilt")
     let qText: String?         // pending AskUserQuestion: the full question text
     let ultra: Bool?           // turn invoked with "ultrathink" → rainbow verb
+    let flashPri: Int?         // how much `preview` should flash: 2 prose / 1 notable action / 0 routine
+    let flashKey: String?      // stable identity for the working preview flash
+    let finishKey: String?     // stable identity for the terminal done flash
 }
 
 /// Self-stepped clock for the hover-peek marquee. SwiftUI's `repeatForever` animations
@@ -669,12 +735,10 @@ struct QueuePeek: View {
 
 /// Drives the front pill's "just finished" moment (see `showingFinishFlash`): the agent's own
 /// reply marquees in white, eases to grey over ~3s (same curve/duration as `PeekFeed.tint`), holds,
-/// then hands off — sliding up and out — to the tab name rising in from below in grey (same
-/// slide curve as `PeekFeed.slide`). Deliberately NOT a SwiftUI `.animation`/`.transition`: those
-/// ride SwiftUI's own animation clock, which doesn't reliably tick in this non-activating panel
-/// with nothing forcing a frame (no hover, no user interaction) — exactly the trap `Ticker` /
-/// `GlyphClock` / `PeekFeed` already work around by self-stepping via `Timer` + `CACurrentMediaTime`
-/// and publishing plain 0...1 progress the view applies directly (no implicit animation involved).
+/// then hands off — sliding up and out — to the tab name rising in from below (same curve as
+/// `PeekFeed.slide`). This stays in SwiftUI because its text layout exactly matches the rest of
+/// the pill; a layer-backed AppKit rewrite looked smoother in theory but produced baseline and
+/// clipping mismatches in the notch.
 final class FinishFlash: ObservableObject {
     @Published var message: String = ""
     @Published var tint: CGFloat = 0     // 0 = white (just shown) → 1 = settled grey, over ~3s
@@ -697,7 +761,7 @@ final class FinishFlash: ObservableObject {
         self.message = message
         slide = 0
         startTint()
-        let hold = Timer(timeInterval: 7.0, repeats: false) { [weak self] _ in
+        let hold = Timer(timeInterval: kFlashHoldS, repeats: false) { [weak self] _ in
             self?.startSlide(onHandoff: onHandoff)
         }
         RunLoop.main.add(hold, forMode: .common)
@@ -912,6 +976,9 @@ struct VisualEffectBlur: NSViewRepresentable {
 struct IslandView: View {
     @ObservedObject var state = IslandState.shared
     @StateObject private var finishFlash = FinishFlash()
+    // Same class, second instance: periodic "Claude just said something" flash while working
+    // (see `freshCommentaryID`) — independent hold/slide timers from the done-flash above.
+    @StateObject private var commentaryFlash = FinishFlash()
 
     private static let coral = Color(red: 232 / 255, green: 112 / 255, blue: 78 / 255) // #E8704E
 
@@ -1194,6 +1261,7 @@ struct IslandView: View {
             // Context fill now lives per-row (right edge), tiered by urgency — the header
             // stays a pure repo/branch group label.
         }
+        .shadow(color: Color.black.opacity(0.55), radius: 1.4)
         .padding(.horizontal, 16)
         .padding(.bottom, 2)   // a little breathing room between the label and its first row
         .frame(width: sheetWidth - 2 * kRowInset, height: kHeaderHeight, alignment: .bottomLeading)
@@ -1309,6 +1377,26 @@ struct IslandView: View {
         // Finished rows lead with the (frozen, green) turn timer — "[dot] [12s] [response]" —
         // instead of trailing it on the right, where it duplicated what the peek already shows.
         let timerOnLeft = (card.status == "done" || card.status == "stale") && !card.elapsed.isEmpty
+        // Context-window fill, per session. Tiered by urgency: below 30% it's inert and stays
+        // hidden; 30–50% is mild (amber) and only surfaces while the row is hovered, so quiet
+        // rows read clean; ≥50% is high enough to pin on always, in red. Shown on every status
+        // (see ringVisible), including the grey idle/stale rows — except "compacting": the
+        // session's last-known context is still the PRE-compaction fill until the new state
+        // lands, so the badge would otherwise sit there showing a number that's already stale
+        // and about to drop.
+        let showContext = card.status != "compacting" && card.context >= 0.30 && (card.context >= 0.50 || hl)
+        // The title Group's halo (below) is tinted to match whichever colored prefix leads
+        // that row, darkened rather than plain black — a black shadow directly behind a
+        // saturated coral/amber/red/blue prefix reads as a muddy smudge; a darkened version
+        // of the SAME hue reads as a natural recede instead.
+        let prefixShadowColor: Color = {
+            if card.status == "working" { return Color(red: 0.41, green: 0.20, blue: 0.14) }       // dark coral
+            if card.status == "thinking" { return card.ultra ? .black : Color(red: 0.45, green: 0.335, blue: 0.0) } // dark amber
+            if card.status == "compacting" || card.status == "compacted" { return Color(red: 0.25, green: 0.29, blue: 0.45) } // dark compact-blue
+            if card.status == "attention" || isError { return Color(red: 0.40, green: 0.13, blue: 0.14) } // dark red
+            if card.status == "struggling" { return Color(red: 0.45, green: 0.335, blue: 0.0) }     // dark amber
+            return .black   // plain title / muted esc-terminal prefix — no strong hue to match
+        }()
         return HStack(spacing: 10) {
             // When the roster spans ≥2 terminal apps, each row leads with its app's icon so you
             // can tell a Warp session from a Cursor one at a glance. Fixed-width slot (drawn empty
@@ -1330,6 +1418,7 @@ struct IslandView: View {
                     .foregroundColor(card.status == "done" ? IslandView.green : Color.white.opacity(0.55))
                     .lineLimit(1)
                     .fixedSize()
+                    .shadow(color: Color.black.opacity(0.55), radius: 1.4)
             }
             Group {
                 // Each row leads with a colored state word ahead of the tab's title, so the
@@ -1341,8 +1430,8 @@ struct IslandView: View {
                 // then the tab title) so a follow-up message updates the row immediately
                 // instead of sticking to what kicked the session off.
                 let livePrompt = card.lastUserMsg.isEmpty ? card.firstPrompt : card.lastUserMsg
-                // "Compacted" rows lead with CC's own away-summary recap once it lands (see
-                // transcriptAwaySummary); until then they fall back to the same live-prompt text
+                // "Compacted" rows lead with CC's own away-summary recap once transcriptSignals
+                // sees it; until then they fall back to the same live-prompt text
                 // as an in-progress row.
                 let rowLabel = (isFinished || isEscTerminal || isError) ? (card.preview.isEmpty ? titleText : card.preview)
                     : (card.status == "compacted" && !card.preview.isEmpty) ? card.preview
@@ -1398,6 +1487,14 @@ struct IslandView: View {
             .font(.custom(kSansFontName, size: 13))
             .lineLimit(1)
             .layoutPriority(1)            // title keeps its width; preview yields first
+            // A soft dark halo behind the title/verb text — same trick as the volume HUD /
+            // Now Playing overlay, where text floats over unpredictable vibrancy. Guarantees
+            // contrast against a bright backdrop bleeding through the glass. Tinted to match
+            // the row's own colored prefix (see prefixShadowColor) rather than plain black —
+            // black behind a saturated coral/amber/red prefix read as a muddy smudge. NOT
+            // applied to the context badge below — that's a solid opaque pill, not blended
+            // text, so a shadow on it just looks like a ring around a shape instead of helping.
+            .shadow(color: prefixShadowColor.opacity(0.65), radius: 1.4)
             // Latest action / message in grey, filling the gap and truncating with an
             // ellipsis. Its expanding frame also right-pins the ring + timer. For an
             // attention row the question takes this slot instead: its header in red, the
@@ -1409,6 +1506,7 @@ struct IslandView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .shadow(color: Color.black.opacity(0.55), radius: 1.4)
             } else if !card.preview.isEmpty && !isFinished && !isEscTerminal && !isError {
                 Text(card.preview)
                     .font(.custom(kSansFontName, size: 12))
@@ -1416,6 +1514,7 @@ struct IslandView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .shadow(color: Color.black.opacity(0.55), radius: 1.4)
             } else {
                 Spacer(minLength: 8)
             }
@@ -1438,36 +1537,60 @@ struct IslandView: View {
                 .background(Capsule(style: .continuous).fill(IslandView.coral.opacity(0.16)))
                 .padding(.trailing, 3)
             }
-            // Context-window fill, per session, floated just left of the timer. Tiered by
-            // urgency: below 30% it's inert and stays hidden; 30–50% is mild (amber) and only
-            // surfaces while the row is hovered, so quiet rows read clean; ≥50% is high enough
-            // to pin on always, in red. Color comes from contextFillColor. Skipped on the grey
-            // idle/stale rows, which carry no live context.
-            if card.status != "idle", card.status != "stale", card.context >= 0.30,
-               card.context >= 0.50 || hl {
+            // Context ring + timer, floated at the row's trailing edge. Bundled into ONE
+            // HStack (not separate siblings of the outer row) — as siblings, the outer row's
+            // own 10pt inter-item spacing stacked with this cluster's internal gaps and read
+            // as a blown-out void around the "·" separator.
+            if showContext || (!card.elapsed.isEmpty && !timerOnLeft) {
                 HStack(spacing: 4) {
-                    ContextRing(pct: card.context)
-                    Text("\(Int((card.context * 100).rounded()))% context")
-                        .font(.custom(kSansFontName, size: 12))
-                        .foregroundColor(contextFillColor(card.context))
-                        .lineLimit(1)
-                        .fixedSize()
+                    if showContext {
+                        // A solid badge, not blended text — its legibility never depends on
+                        // whatever's behind the panel (bright IDE, dark terminal, anything),
+                        // since it's an opaque filled shape rather than anti-aliased glyph
+                        // strokes sitting on a translucent gradient. Ring + percent both go
+                        // white on top of it.
+                        HStack(spacing: 4) {
+                            ContextRing(pct: card.context, colorOverride: contextForegroundColor(card.context))
+                            Text("\(Int((card.context * 100).rounded()))% context")
+                                .font(.custom(kSansFontName, size: 12))
+                                .foregroundColor(contextForegroundColor(card.context))
+                                .lineLimit(1)
+                                .fixedSize()
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule(style: .continuous).fill(contextFillColor(card.context)))
+                        // Hovering the badge once it's red (≥50%) surfaces a nudge to compact —
+                        // the amber 30–50% band stays quiet since it's not yet actionable.
+                        // Floats to the LEFT of the badge: overlay(.leading) starts the tooltip
+                        // at the badge's own left edge, then a manual offset (by its own
+                        // measured width + an 8pt gap) shifts it fully clear of the badge — the
+                        // badge sits at the row's trailing end, so a left-floating tooltip has
+                        // room to grow without pushing past the sheet's edge.
+                        .overlay(alignment: .leading) {
+                            if state.hoveredRing == card.id, card.context >= 0.5 {
+                                let tooltipW = textWidth("Consider Compacting", kTooltipFont) + 14
+                                compactTooltip
+                                    .offset(x: -(tooltipW + 8))
+                            }
+                        }
+                    }
+                    if showContext, !card.elapsed.isEmpty, !timerOnLeft {
+                        Text("·")
+                            .font(.custom(kSansFontName, size: 12))
+                            .foregroundColor(Color.white.opacity(0.55))
+                            .shadow(color: Color.black.opacity(0.55), radius: 1.4)
+                    }
+                    if !card.elapsed.isEmpty, !timerOnLeft {
+                        Text(card.elapsed)
+                            .font(.custom(kSansFontName, size: 12))
+                            .monospacedDigit()
+                            .foregroundColor(card.status == "done" ? IslandView.green : Color.white.opacity(0.55))
+                            .lineLimit(1)
+                            .fixedSize()
+                            .shadow(color: Color.black.opacity(0.55), radius: 1.4)
+                    }
                 }
-                if !card.elapsed.isEmpty && !timerOnLeft {
-                    Text("·")
-                        .font(.custom(kSansFontName, size: 12))
-                        .foregroundColor(Color.white.opacity(0.55))
-                        .padding(.horizontal, 4)
-                }
-            }
-            // Active rows keep the timer on the right; finished rows moved it to the left.
-            if !card.elapsed.isEmpty && !timerOnLeft {
-                Text(card.elapsed)
-                    .font(.custom(kSansFontName, size: 12))
-                    .monospacedDigit()
-                    .foregroundColor(card.status == "done" ? IslandView.green : Color.white.opacity(0.55))
-                    .lineLimit(1)
-                    .fixedSize()
             }
         }
         .padding(.horizontal, 12)
@@ -1482,6 +1605,21 @@ struct IslandView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture { AppController.shared?.focusCardTab(card.id) }
+    }
+
+    // Tooltip nudge shown while hovering a red (≥50%) context badge — floats to its left.
+    private var compactTooltip: some View {
+        Text("Consider Compacting")
+            .font(.custom(kSansFontName, size: 11))
+            .foregroundColor(.white)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(Capsule(style: .continuous).fill(Color(white: 0.15)))
+            .overlay(Capsule(style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 1))
+            .transition(.opacity)
+            .zIndex(10)
     }
 
     // Width reserved for the leading icon (gif / image / glyph) + spacing.
@@ -1561,8 +1699,14 @@ struct IslandView: View {
     // Right cluster: leading pad (3) + message text. The context ring now lives per-row in
     // the dropdown, so the front pill no longer draws it (would be redundant).
     static let finishFlashLeadPad: CGFloat = 14
-    // Same leading pad whether or not the flash is CURRENTLY active, as long as we're in "done".
-    private var rightLeadPad: CGFloat { state.mode == .done ? IslandView.finishFlashLeadPad : 3 }
+    // Same leading pad whether or not a flash is CURRENTLY active, as long as we're in "done"
+    // or "working" — those are exactly the two modes that can show a FinishFlashView (done's
+    // own reply, or working's periodic commentary flash), and holding the pad constant across
+    // the whole mode (not just its flash sub-state) is what keeps `rightW` from jumping the
+    // instant a flash starts or ends (see `doneBoxWidth`'s note below).
+    private var rightLeadPad: CGFloat {
+        (state.mode == .done || state.mode == .working) ? IslandView.finishFlashLeadPad : 3
+    }
     // The finish-flash marquees within a box sized to the TAB NAME it'll settle into — not a
     // separate fixed width — specifically so `rightW` (and therefore `pillWidth`/`islandOffset`,
     // the whole pill's position) is the SAME value for the entire "done" state: while the message
@@ -1571,7 +1715,8 @@ struct IslandView: View {
     // real width, and that residual delta — not padding, not alignment, not animation timing —
     // was the pixel jump: however carefully the swap itself is handled, two different box widths
     // on either side of it will always show *some* gap. Same width throughout removes the gap
-    // instead of trying to hide it.
+    // instead of trying to hide it. Reused as-is for the working-commentary flash: `rightText`
+    // in `.working` is already `clip(state.title)`, so this is the same value either way.
     private var doneBoxWidth: CGFloat { textWidth(clip(state.title), IslandView.sansFont) }
     private var rightW: CGFloat {
         if state.mode == .done && !state.aggregate { return rightLeadPad + doneBoxWidth }
@@ -1639,6 +1784,22 @@ struct IslandView: View {
     // multi-second animation itself lives entirely in the view (see `island`/`FinishFlashView`).
     private var showingFinishFlash: Bool {
         state.mode == .done && !state.aggregate && state.justFinishedID != nil
+            && !state.preview.isEmpty && finishFlash.message == state.preview
+    }
+    // Same idea while a session is actively working: briefly shows Claude's latest genuine
+    // commentary instead of the tab name (see `freshCommentaryID`), then hands back off.
+    private var showingCommentaryFlash: Bool {
+        state.mode == .working && !state.aggregate && state.freshCommentaryID != nil
+            && !state.commentaryMessage.isEmpty && commentaryFlash.message == state.commentaryMessage
+    }
+
+    // DEBUG: a compact signature of whatever the right slot is CURRENTLY showing, so an
+    // `.onChange` on it can log every visible change with timing (see logFlicker). Gated by a
+    // sentinel file, so this is inert unless flicker-logging is turned on.
+    private var rightSignature: String {
+        if showingFinishFlash { return "FINISH|\(finishFlash.message)" }
+        if showingCommentaryFlash { return "FLASH|\(commentaryFlash.message)" }
+        return "plain|\(rightText)"
     }
 
     // Right side: live timer while thinking; a clip of Claude's message/action
@@ -1700,6 +1861,10 @@ struct IslandView: View {
                     FinishFlashView(flash: finishFlash, width: doneBoxWidth, tabName: clip(state.title))
                         .padding(.leading, IslandView.finishFlashLeadPad)
                         .transition(.identity)
+                } else if showingCommentaryFlash {
+                    FinishFlashView(flash: commentaryFlash, width: doneBoxWidth, tabName: clip(state.title))
+                        .padding(.leading, IslandView.finishFlashLeadPad)
+                        .transition(.identity)
                 } else if !rightText.isEmpty {
                     rightTextView
                         .font(.custom(kSansFontName, size: 13))
@@ -1728,6 +1893,24 @@ struct IslandView: View {
                 }
             }
         }
+        // Same pattern as justFinishedID above, for the periodic working-commentary flash.
+        // Fires once per fresh commentary key (see rebuild()'s edge-detection) — restarts the
+        // hold+slide sequence even if a previous flash is still mid-hold, so newer commentary
+        // always wins over older.
+        .onChange(of: state.freshCommentaryID) { newValue in
+            guard newValue != nil else {
+                commentaryFlash.stop()
+                return
+            }
+            commentaryFlash.start(message: state.commentaryMessage) {
+                if IslandState.shared.freshCommentaryID != nil {
+                    IslandState.shared.freshCommentaryID = nil
+                }
+            }
+        }
+        // DEBUG: log every visible change of the right slot with high-res timing (gated by a
+        // sentinel file — inert otherwise). Lets us quantify the flicker cadence.
+        .onChange(of: rightSignature) { sig in AppController.shared?.logFlicker(sig) }
         .padding(.horizontal, 18)
         .frame(width: pillWidth, height: islandHeight)   // top row stays pinned to the notch
         // Background grows DOWN by the peek on hover; the row above stays put, and the
@@ -1743,16 +1926,24 @@ struct IslandView: View {
                 .fill(state.dropdownOpen ? Color.clear : Color.black)
         )
         .overlay(alignment: .bottom) {
-            // Notch → a static "Happy Clauding". While the agent is actively replying (working)
-            // or just finished, the peek shows its live/final response (preview). While thinking
-            // (no reply yet) it shows the user's latest message instead. Marquee'd if it overflows.
-            let showResponse = !state.preview.isEmpty
+            // The peek and the right pill stay COMPLEMENTARY: whichever of {tab name, live
+            // step/response} is on the right, the peek shows the other — never both the same
+            // thing. So while a flash is putting the response/commentary on the right (the done
+            // reply, or the working commentary flash), the peek shows the tab name; once the
+            // flash hands back to the tab name on the right, the peek shows the live step/
+            // commentary (the usual). Thinking (no reply yet) still falls back to the user's
+            // latest message; idle shows nothing (hovering the notch itself still gives the
+            // usage peek via `state.notchPeek`). Marquee'd if it overflows.
+            let flashOnRight = showingFinishFlash || showingCommentaryFlash
+            let hasResponse = !state.preview.isEmpty
                 && (state.mode == .working || state.mode == .done)
-            // Idle has no message/title worth narrating — hovering the icon (off the literal
-            // notch) shows nothing rather than a bare "Claude Code"; hovering the notch itself
-            // still shows the usage peek via `state.notchPeek` below.
-            let peekText = showResponse ? state.preview
-                : (state.mode == .idle ? "" : (state.lastUserMsg.isEmpty ? state.title : state.lastUserMsg))
+            let tabNamePeek = state.title.isEmpty ? state.project : state.title
+            let peekText: String = {
+                if state.mode == .idle { return "" }
+                if flashOnRight { return tabNamePeek }           // response is on the right → tab name here
+                if hasResponse { return state.preview }          // tab name on the right → live step here
+                return state.lastUserMsg.isEmpty ? state.title : state.lastUserMsg
+            }()
             if frontPeekH > 0 && (state.notchPeek || !peekText.isEmpty) {
                 Group {
                     if state.notchPeek {
@@ -1890,7 +2081,9 @@ struct IslandView: View {
             case .running:
                 BusyGlyph(color: IslandView.coral, interval: 0.2, size: 17)
             case .done:
-                Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundColor(IslandView.green).frame(width: 18)
+                // Same "✻" static busy-glyph mark as the dropdown's rowMarker for "done" —
+                // not a checkmark, so a finished session reads consistently across both.
+                Text("✻").font(.system(size: 12, weight: .bold)).foregroundColor(IslandView.green).frame(width: 18)
             case .error:
                 Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 12, weight: .semibold)).foregroundColor(IslandView.red).frame(width: 16)
             }
@@ -1914,11 +2107,13 @@ struct IslandView: View {
         case .error:
             Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 12, weight: .semibold)).foregroundColor(accent).frame(width: 16)
         case .done:
-            Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundColor(accent).frame(width: 18)
+            // Same "✻" static busy-glyph mark as the dropdown's rowMarker — not a checkmark,
+            // so a finished session reads consistently in both the front pill and dropdown.
+            Text("✻").font(.system(size: 12, weight: .bold)).foregroundColor(accent).frame(width: 18)
         case .compacting:
             BusyGlyph(color: accent, interval: 0.25, size: 17)
         case .compacted:
-            Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundColor(accent).frame(width: 18)
+            Text("✻").font(.system(size: 12, weight: .bold)).foregroundColor(accent).frame(width: 18)
         case .idle:
             // Resting "paused" Claude mark: the static busy glyph. During the hover-hint stage
             // it breathes (scale + opacity) to confirm the hover; once revealed in full it
@@ -2196,6 +2391,9 @@ final class LiveSession {
     var qHeader = ""      // pending AskUserQuestion: short topic label
     var qText = ""        // pending AskUserQuestion: full question text
     var ultra = false     // "ultrathink" turn → rainbow verb
+    var flashPri = 0      // how much `preview` should flash: 2 prose / 1 notable action / 0 routine
+    var flashKey = ""     // stable identity for the current preview; preview text can vary by producer
+    var finishKey = ""    // stable identity for the current terminal reply flash
     var project = ""
     var aiTitle = ""
     var context = 0.0
@@ -2214,7 +2412,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var clockTimer: Timer?
     private var gcTimer: Timer?
     private var liveTimer: Timer?   // fast poll of CC's live status; runs ONLY mid-turn
-    private var livenessTick = 0    // skip-counter so the liveness scan backs off while hidden
+    private var lastLivenessScanTs = 0.0
+    private var livenessScanning = false
+    private var pendingLivenessForce = false
     private var knownSessionIds: Set<String> = []   // session files seen last reload (detect new tabs)
     private var dropdownTimer: Timer?   // 1s refresh while the dropdown is open (subagent rows
                                         // don't fire hooks, so nothing else re-reads them)
@@ -2241,6 +2441,19 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var lastSingleFocus: String?        // the tab that last held the front as the lone
                                                 // running session; lets its completion keep the
                                                 // single "Finished" pill instead of an aggregate count
+    private let appStartTs = Date().timeIntervalSince1970
+    private var shownFlashKeys: Set<String> = []
+    private var shownFinishKeys: Set<String> = []
+    // Edge-detects fresh commentary for the front pill's periodic flash (see `freshCommentaryID`):
+    // a transcript-stable activity key for whatever was last acted on. Preview text is display
+    // only; hook/poll can disagree on string length without making the same event flash twice.
+    private var lastCommentaryKey: String = ""
+    private var lastFlashStartTs: Double = 0   // when the current front-pill flash began (epoch),
+                                               // for the kCommentaryHoldS protected window
+    private var lastFlashPriority: Int = 0     // its priority (2 prose / 1 notable action), so a
+                                               // higher-priority item can preempt it mid-hold
+    // DEBUG flicker logger (gated by ~/.claude-island/flicker.on): last log time + on/off cache.
+    private var lastFlickerT: Double = 0
     private var dismissedDoneIds: Set<String> = []  // clicked-away "Finished" pills — excluded
                                                 // from front-selection until they do something new
 
@@ -2362,9 +2575,9 @@ final class AppController: NSObject, NSApplicationDelegate {
                                                object: nil)
 
         // Periodic liveness scan: prune sessions whose tab closed or whose turn the
-        // user canceled (Esc), then refresh the deck. The process/transcript IO runs
-        // off the main thread so it never freezes the bar.
-        let g = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
+        // user canceled (Esc), then refresh the deck. This timer ticks cheaply once/sec;
+        // refreshLiveness decides whether a real background scan is due for the current state.
+        let g = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             self?.refreshLiveness()
         }
         RunLoop.main.add(g, forMode: .common)
@@ -2373,7 +2586,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         // Fast live poll: reads CC's own busy/idle status files and tails each transcript so the
         // verb/preview/active-state track real activity at sub-second latency between hook events.
         // Started on demand by rebuild() ONLY while a turn is active (working/thinking) — idle
-        // sessions have nothing to poll, so this no longer wakes the CPU ~2×/sec around the clock.
+        // sessions have nothing to poll, so this no longer wakes the CPU around the clock.
         // All IO runs off the main thread.
 
         // Drive back-card hover ourselves. SwiftUI's onHover relies on a tracking area
@@ -2708,6 +2921,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         (curPillWidth, curIslandOffset) = idleGeom(primary: "", right: idleRightLabel())
         position()
         panel.orderFrontRegardless()
+        refreshLiveness(force: true)   // refresh idle/exited tabs while the user is looking
         // …then spring open on the next tick, so the .animation(value:) catches the 0→1 change
         // and plays the bouncy entrance.
         DispatchQueue.main.async { IslandState.shared.idleReveal = 1 }
@@ -2775,12 +2989,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         return p.x >= left && p.x <= right && p.y >= bottom && p.y <= f.maxY
     }
 
-    /// The idle pill's right side ONLY — everything past the leading icon. Hovering the
-    /// "{n} sessions" / "{n} idle sessions" count text opens the dropdown; hovering the icon
-    /// itself must not (it's just the resting mark). `island`'s HStack has an outer
+    /// The idle pill's right side ONLY — the actual "{n} sessions" / "{n} idle sessions" text,
+    /// nothing before it. Hovering that text opens the dropdown; hovering the icon, or the
+    /// physical notch cutout + its clearance sitting between the icon and the text, must not
+    /// (both are just resting/peek territory). `island`'s HStack has an outer
     /// `.padding(.horizontal, 18)` before the icon even starts, THEN the 18pt icon slot
-    /// (`leadingSlot`, no verb text next to it in .idle) — both have to be skipped, not just
-    /// one (that was the bug: skipping only 18 landed inside the padding, still over the icon).
+    /// (`leadingSlot`, no verb text next to it in .idle), THEN the notch gap itself
+    /// (`notchWidth + notchClearance`, per `pillWidth`/`islandOffset`) before the text run
+    /// begins — all three have to be skipped, not just the first two (that was the bug: the
+    /// dropdown was opening just from hovering the notch to reveal the pill, since skipping
+    /// only the icon still landed inside the notch gap, not yet at the text).
     private func pointInFrontPillRight(_ p: NSPoint) -> Bool {
         let s = IslandState.shared
         let f = panel.frame
@@ -2788,7 +3006,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         let center = f.midX + curIslandOffset
         let outerPadding: CGFloat = 18
         let leadingSlot: CGFloat = 18
-        let left = center - curPillWidth / 2 + outerPadding + leadingSlot
+        let notchGap: CGFloat = s.notchWidth + 80   // notchClearance, mirrors IslandView.pillWidth
+        let left = center - curPillWidth / 2 + outerPadding + leadingSlot + notchGap
         let right = center + curPillWidth / 2
         let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
         return p.x >= left && p.x <= right && p.y >= bottom && p.y <= f.maxY
@@ -2976,13 +3195,27 @@ final class AppController: NSObject, NSApplicationDelegate {
                 // a row OR its header, so the highlight is robust to row/header hit-test drift.
                 let grp = item.isHeader ? String(item.id.dropFirst(4)) : item.card?.groupKey   // "hdr:" == 4
                 if s.hoveredGroup != grp { s.hoveredGroup = grp }
-                // The ring sits LEFT of the (variable-width) timer: trailing pad (12), then
-                // the timer, then a 10px gap, then the 12px ring. Locate that band.
+                // Mirror dropdownRow's trailing HStack (spacing 4) right-to-left: trailing pad
+                // (12), [timer], [4, "·"], 4, then the pill (6px pad, percent text, 4px gap,
+                // 12px ring, 6px pad) — to locate the badge's actual band (it sits well left of
+                // the timer, not flush against it).
                 let overRing: Bool = item.card.map { card in
                     guard ringVisible(card) else { return false }
-                    let timerW = card.elapsed.isEmpty ? 0 : textWidth(card.elapsed, kTimerFont)
-                    let ringRight = listRight - 12 - (timerW > 0 ? timerW + 10 : 0)
-                    return p.x >= ringRight - 12 - 6 && p.x <= ringRight + 6
+                    // This row is under the cursor, so it's the hovered row — the same `hl`
+                    // that gates the 30–50% (amber) tier into view in dropdownRow. Compacting
+                    // rows never draw the badge (see showContext), so never hit-test one either.
+                    guard card.status != "compacting", card.context >= 0.30 else { return false }
+                    let timerOnLeft = (card.status == "done" || card.status == "stale") && !card.elapsed.isEmpty
+                    let timerW = (!card.elapsed.isEmpty && !timerOnLeft) ? textWidth(card.elapsed, kTimerFont) : 0
+                    let dotW = (!card.elapsed.isEmpty && !timerOnLeft) ? textWidth("·", kTimerFont) : 0
+                    let percentStr = "\(Int((card.context * 100).rounded()))% context"
+                    let percentW = textWidth(percentStr, kTimerFont)
+                    let pillPad: CGFloat = 6
+                    var pillRight = listRight - 12
+                    if timerW > 0 { pillRight -= timerW + 4 }
+                    if dotW > 0 { pillRight -= dotW + 4 }
+                    let pillLeft = pillRight - pillPad - percentW - 4 - 12 - pillPad
+                    return p.x >= pillLeft && p.x <= pillRight
                 } ?? false
                 let ringID = overRing ? id : nil
                 if s.hoveredRing != ringID { s.hoveredRing = ringID }
@@ -3011,14 +3244,31 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func livenessInterval() -> Double {
+        let s = IslandState.shared
+        if s.dropdownOpen || idlePeekShown { return kLivenessInspectIntervalS }
+        if hiddenIdle { return kLivenessHiddenIntervalS }
+        return kLivenessActiveIntervalS
+    }
+
+    private func liveTabGrace() -> Double {
+        (IslandState.shared.dropdownOpen || idlePeekShown) ? kLiveTabGraceInspectS : kLiveTabGraceDefaultS
+    }
+
     /// Run the expensive process scan + transcript checks on a background queue,
     /// then apply the results (prune dead/canceled sessions, rebuild) on main.
     private func refreshLiveness(force: Bool = false) {
-        // While hidden (nothing live), the expensive process/sqlite/transcript scan backs off to
-        // ~20s — there's no UI to keep fresh. A brand-new session file kicks an immediate scan
-        // (force=true, from reload) so the tab still appears with ~no latency.
-        livenessTick &+= 1
-        if !force && hiddenIdle && livenessTick % 5 != 0 { return }
+        // The timer ticks once/sec, but the real scan cadence is state-aware: snappy while a
+        // roster is visible, moderate while the island is visible, slow when fully hidden. Forced
+        // scans (new file, dropdown open, idle reveal) skip the cadence gate.
+        let now = Date().timeIntervalSince1970
+        if livenessScanning {
+            if force { pendingLivenessForce = true }
+            return
+        }
+        if !force && now - lastLivenessScanTs < livenessInterval() { return }
+        livenessScanning = true
+        lastLivenessScanTs = now
         let hidden = hiddenIdle
         // Any mid-turn session (thinking/working) or a pending question (attention) can be
         // Esc'd — an interrupt fires no Stop hook, so the transcript's "Request interrupted by
@@ -3034,7 +3284,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         let titleScan = sessions.compactMap { $0.value.transcript.isEmpty ? nil : ($0.key, $0.value.transcript) }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let live = self.computeLiveTabs()
+            let cc = self.ccSessionInfos()
+            let live = self.computeLiveTabs(cc)
             let warpTab = hidden ? nil : self.warpActiveTab()   // skip Warp's sqlite read when hidden (no UI)
             // CC's own busy/idle read — unlike pollLiveStatus (which only ever flips to
             // "interrupted" once CC itself reports idle), this scan otherwise trusts the
@@ -3042,9 +3293,9 @@ final class AppController: NSObject, NSApplicationDelegate {
             // question) writes the "Request interrupted by user" marker before the resumed
             // real content streams back in, so a thinking/working session can transiently
             // read as abandoned while CC is still actively computing the resume. Cross-check
-            // busy status here too so this slower (4s) backstop can't flip an actually-busy
-            // session — pollLiveStatus (0.6s) already owns that transition correctly.
-            let statuses = self.ccSessionStatuses()
+            // busy status here too so this periodic backstop can't flip an actually-busy
+            // session — the sub-second poll already owns that transition correctly.
+            let statuses = self.ccSessionStatuses(cc)
             var interrupted = Set<String>()
             var declinedPreview: [String: String] = [:]
             for (uuid, mode, tx) in active where !tx.isEmpty {
@@ -3052,10 +3303,11 @@ final class AppController: NSObject, NSApplicationDelegate {
                     let sessionId = ((tx as NSString).lastPathComponent as NSString).deletingPathExtension
                     if statuses[sessionId] == "busy" { continue }
                 }
-                if self.transcriptInterrupted(tx) {
+                let signals = self.transcriptSignals(tx)
+                if signals.interrupted {
                     interrupted.insert(uuid)
                     // The agent's response so far, shown in white on the declined row.
-                    if let p = self.transcriptActivity(tx)?.preview, !p.isEmpty { declinedPreview[uuid] = p }
+                    if let p = signals.activity?.preview, !p.isEmpty { declinedPreview[uuid] = p }
                 }
             }
             var titles: [String: String] = [:]
@@ -3071,6 +3323,13 @@ final class AppController: NSObject, NSApplicationDelegate {
                 }
             }
             DispatchQueue.main.async {
+                defer {
+                    self.livenessScanning = false
+                    if self.pendingLivenessForce {
+                        self.pendingLivenessForce = false
+                        self.refreshLiveness(force: true)
+                    }
+                }
                 let now = Date().timeIntervalSince1970
                 self.applyDBActiveTab(warpTab)
                 // Apply any renamed titles (manual /rename wins over the auto ai-title).
@@ -3083,10 +3342,11 @@ final class AppController: NSObject, NSApplicationDelegate {
                     if !c.isEmpty { self.liveTabCwd[u] = c }
                 }
                 for (u, f) in live.focuses { self.liveTabFocus[u] = f }
-                // A tab counts as live if a scan saw it in the last 8s — smooths a single
-                // transient `ps` miss (scans are every 4s) so a live tab never flickers
-                // out, while a genuinely-closed tab clears in ~8-12s.
-                self.liveTabs = Set(self.lastSeenLive.filter { now - $0.value < 8 }.keys)
+                // A tab counts as live if a recent scan saw it — long enough in the background
+                // to smooth a transient ps miss, shorter while the roster is visible so exited
+                // sessions disappear quickly.
+                let grace = self.liveTabGrace()
+                self.liveTabs = Set(self.lastSeenLive.filter { now - $0.value < grace }.keys)
                 self.liveTabs.insert("local")
                 // Only canceled turns delete a file; dead tabs are just hidden by the
                 // liveTabs filter (their file lingers harmlessly until they reappear).
@@ -3154,6 +3414,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         // the cursor; release it on close so the list re-sorts by recency again.
         dropdownFrozenOrder = s.roster.map { $0.id }
         rebuild()            // populate subagent rows immediately on open
+        refreshLiveness(force: true)   // opening is explicit inspection; don't wait for timer/backoff
         position()
         // Subagents don't fire hooks, so neither the file-watch nor the mid-turn clock
         // refreshes them. Drive a 1s tick of our own while the menu is open.
@@ -3210,6 +3471,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         if let v = sf.detail { s.detail = v }
         if let v = sf.preview { s.preview = v }   // omitted by emit_keep → retained
+        if let v = sf.flashPri { s.flashPri = v }
+        if let v = sf.flashKey { s.flashKey = v }
+        if let v = sf.finishKey { s.finishKey = v }
         if let v = sf.firstPrompt, !v.isEmpty { s.firstPrompt = v }
         if let v = sf.lastPrompt, !v.isEmpty { s.lastUserMsg = v }
         // Question carried by an AskUserQuestion pause. Present (incl. "") on every full emit
@@ -3239,11 +3503,39 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         if let v = sf.transcript { s.transcript = v }
         if let v = sf.ts { s.ts = v }
+        if s.mode == "done" {
+            if s.finishKey.isEmpty { s.finishKey = fallbackFinishKey(id, s) }
+            if s.ts > 0, s.ts < appStartTs { shownFinishKeys.insert(s.finishKey) }
+        }
         if sf.kind == "prompt" {                  // a new turn the user just started
             s.promptTs = sf.ts ?? s.promptTs
             s.turnStartTs = sf.ts ?? s.turnStartTs
             clickFocus = nil                      // a fresh prompt takes focus
         }
+    }
+
+    private func fallbackActivityKey(_ session: LiveSession, preview: String, priority: Int) -> String {
+        let norm = normalizedFlashText(preview)
+        let scope = session.transcript.isEmpty ? "" : session.transcript + "\n"
+        return "fallback:\(priority):\(stableKeyHash(scope + norm))"
+    }
+
+    private func activityFlashKey(_ session: LiveSession, preview: String, priority: Int) -> String {
+        if !session.flashKey.isEmpty { return session.flashKey }
+        return fallbackActivityKey(session, preview: preview, priority: priority)
+    }
+
+    private func fallbackFinishKey(_ id: String, _ session: LiveSession) -> String {
+        if !session.flashKey.isEmpty, session.flashKey.hasPrefix("text:") {
+            return "finish:\(session.flashKey)"
+        }
+        let scope = session.transcript.isEmpty ? id : session.transcript
+        return "finish:\(stableKeyHash(scope + "\n" + normalizedFlashText(session.preview)))"
+    }
+
+    private func finishFlashKey(_ id: String, _ session: LiveSession) -> String {
+        if !session.finishKey.isEmpty { return session.finishKey }
+        return fallbackFinishKey(id, session)
     }
 
     // MARK: - Rebuild the deck
@@ -3280,29 +3572,44 @@ final class AppController: NSObject, NSApplicationDelegate {
             // or file cleared) may still be open. Surface them as "{n} idle sessions" + a hover
             // list, exactly like stale ones, instead of collapsing to a bare "Idle".
             let s = IslandState.shared
-            let idleCards = liveTabs
-                .filter { $0 != "local" && !suppress.contains($0) }
+            let idleTabIds = liveTabs.filter { $0 != "local" && !suppress.contains($0) }
+            let idleCwds = Set(idleTabIds.compactMap { liveTabCwd[$0] }.filter { !$0.isEmpty })
+            refreshGitInfo(idleCwds)
+            let idleCards = idleTabIds
                 .sorted()
                 .map { u -> SessionCard in
                     let cwd = liveTabCwd[u] ?? ""
                     let proj = cwd.isEmpty ? "Claude Code" : (cwd as NSString).lastPathComponent
                     let label = liveTabTitle[u] ?? ""
-                    return SessionCard(id: u, project: proj, title: label.isEmpty ? proj : label,
-                                       status: "idle", focus: liveTabFocus[u] ?? "warp://session/\(u)",
-                                       context: liveTabContext[u] ?? 0)
+                    let g = self.gitGroup(cwd, proj)
+                    var card = SessionCard(id: u, project: proj, title: label.isEmpty ? proj : label,
+                                           status: "idle", focus: liveTabFocus[u] ?? "warp://session/\(u)",
+                                           context: liveTabContext[u] ?? 0)
+                    card.repo = g.repo; card.branch = g.branch
+                    card.files = g.files; card.added = g.added; card.removed = g.removed
+                    return card
                 }
-            if !s.dropdownOpen {
+            if s.dropdownOpen {
+                let rank = Dictionary(s.roster.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+                s.roster = idleCards.sorted {
+                    let ra = rank[$0.id] ?? Int.max, rb = rank[$1.id] ?? Int.max
+                    return ra != rb ? ra < rb : $0.id < $1.id
+                }
+                rebuildDropdownItems()
+            } else {
                 s.cards = Array(idleCards.dropFirst().prefix(5))
                 s.roster = idleCards
                 rebuildDropdownItems()
             }
-            enterHiddenIdle(idleCount: s.dropdownOpen ? s.roster.count : idleCards.count)
+            enterHiddenIdle(idleCount: s.roster.count)
             return
         }
 
         // Probe git context (repo/branch/churn) for the visible cwds — drives the dropdown's
         // repo/branch grouping + header churn. No-op unless the dropdown is open (throttled).
-        refreshGitInfo(Set(vis.values.map(\.cwd).filter { !$0.isEmpty }))
+        var gitCwds = Set(vis.values.map(\.cwd).filter { !$0.isEmpty })
+        gitCwds.formUnion(liveTabCwd.values.filter { !$0.isEmpty })
+        refreshGitInfo(gitCwds)
 
         // Front pill: a clicked tab wins (pinned until the next prompt), else the most
         // recently prompted, else the most recent activity. All candidates have really
@@ -3407,7 +3714,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         // surfaced by the on-hover front-pill peek.
         state.title = f.aiTitle.isEmpty ? f.project : f.aiTitle
         state.lastUserMsg = f.lastUserMsg
-        state.contextPct = statuslineContext(f.transcript) ?? f.context
+        state.contextPct = sessionContext(f)
         state.focusURL = f.focus
 
         // Every visible session has had its "Finished" pill dismissed (clicked away) and
@@ -3452,11 +3759,12 @@ final class AppController: NSObject, NSApplicationDelegate {
                                title: v.aiTitle.isEmpty ? v.project : v.aiTitle,
                                status: status, verb: verb, focus: v.focus, isSelected: k == selected,
                                elapsed: showTimer ? formatElapsed(v) : "",
-                               context: self.statuslineContext(v.transcript) ?? v.context,
+                               context: self.sessionContext(v),
                                preview: v.preview, firstPrompt: v.firstPrompt,
                                qHeader: v.qHeader, qText: v.qText)
             card.lastUserMsg = v.lastUserMsg
             card.ultra = v.ultra
+            card.flashPri = v.flashPri
             // Git context for repo/branch grouping + header churn (cache lookup; bg-probed).
             let g = self.gitGroup(v.cwd, v.project)
             card.repo = g.repo; card.branch = g.branch
@@ -3477,6 +3785,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             s.mode = "idle"
             s.focus = liveTabFocus[u] ?? "warp://session/\(u)"
             let cwd = liveTabCwd[u] ?? ""
+            s.cwd = cwd
             s.project = cwd.isEmpty ? "Claude Code" : (cwd as NSString).lastPathComponent
             // Prefer the tab's last-known session title over its directory name.
             s.aiTitle = liveTabTitle[u] ?? ""
@@ -3524,9 +3833,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         // Delegating sessions (parent done, subagent still live) count as active too — otherwise
         // the clock/poll stops and the overlay never re-evaluates when the delegate finishes.
         // A freshly-compacted session also counts, but only for a short grace window: CC's own
-        // "away summary" recap (see transcriptAwaySummary) lands a little after the compact
+        // "away summary" recap (read by transcriptSignals) lands a little after the compact
         // finishes, not synchronously with it, so the poll needs to keep checking for a bit —
-        // but NOT forever, or an old untouched "Compacted" row would wake the CPU ~2×/sec
+        // but NOT forever, or an old untouched "Compacted" row would wake the CPU repeatedly
         // indefinitely just waiting for a recap that already came (or is never coming).
         let anyActive = vis.contains {
             $0.value.mode == "working" || $0.value.mode == "thinking" || delegating.contains($0.key)
@@ -3553,6 +3862,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         // ≥2 sessions that have run → count aggregate, UNLESS a single running tab has claimed
         // the front for its full live activity (then show that, not the counts).
         state.aggregate = !allFrontsDismissed && !focusedRunning && !focusedDone && (running + needYou + done + errored) >= 2
+        if state.aggregate {
+            for (id, session) in vis where doneFamily.contains(effMode(id, session)) && !session.preview.isEmpty {
+                shownFinishKeys.insert(finishFlashKey(id, session))
+            }
+        }
 
         // A single front session just landed at "done" (not merely still sitting there from a
         // prior rebuild) → tell the view to (re)start its finish-flash (see `FinishFlash`) by
@@ -3564,11 +3878,67 @@ final class AppController: NSObject, NSApplicationDelegate {
         // inside openDropdown() (dropdownOpen=true; rebuild()), and forcing a "no animation"
         // transaction here suppressed the dropdown's OWN open animation too (both land in the
         // same update pass), making the whole island snap open instead of springing.
-        if state.mode == .done, !state.aggregate, !state.preview.isEmpty,
-           (front != prevFrontUUID || prevMode != .done) {
-            state.justFinishedID = front
+        let finishIdentity = finishFlashKey(front, f)
+        if state.mode == .done, !state.preview.isEmpty {
+            if state.aggregate {
+                shownFinishKeys.insert(finishIdentity)
+                state.justFinishedID = nil
+            } else if !shownFinishKeys.contains(finishIdentity),
+                      (front != prevFrontUUID || prevMode != .done) {
+                shownFinishKeys.insert(finishIdentity)
+                state.justFinishedID = finishIdentity
+            }
         } else if state.mode != .done || state.aggregate {
             state.justFinishedID = nil
+        }
+
+        // A working front session's latest preview is "flash-worthy" when flashPri ≥ 1 — either
+        // Claude's own prose (2) or a notable action like Write/Edit/Bash/Fetch/Task (1); routine
+        // reads/greps (0) never flash. Flash it in the right slot the same way justFinishedID
+        // flashes the done reply, with a priority-aware DWELL so it reads instead of flickering:
+        //   • the item on screen is protected for its dwell — a full kFlashHoldS (~7s, time to
+        //     read) before a lower-priority tool label can replace prose, a short kToolDwellS
+        //     (~1.2s) for a tool label so a burst of rapid tool calls coalesces into one instead
+        //     of stuttering;
+        //   • newer prose can refresh older prose after kProseRefreshS, so the island does not
+        //     feel stuck narrating stale commentary while still blocking the old 1ms tool stomp;
+        //   • a strictly-higher-priority item cuts in immediately — a comment (2) still wins over
+        //     a showing tool label (1) at once ("commentary wins"); past the dwell, anything newer
+        //     takes over. Because each rebuild re-evaluates the CURRENT preview, a suppressed
+        //     burst still converges to the latest value once the dwell passes (never "2 behind").
+        // The message shown is captured HERE (commentaryMessage), not re-read when the flash
+        // starts — see that field for why. The identity is the transcript activity key, not
+        // the display string, so hook/poll preview-length differences cannot re-flash it.
+        let flashPri = f.flashPri
+        let flashIdentity = activityFlashKey(f, preview: state.preview, priority: flashPri)
+        let commentaryKey = flashIdentity
+        let alreadyShown = shownFlashKeys.contains(flashIdentity)
+        let held = now - lastFlashStartTs
+        let dwell = lastFlashPriority >= 2 ? kFlashHoldS : kToolDwellS
+        let proseRefresh = flashPri >= 2 && lastFlashPriority >= 2 && held >= kProseRefreshS
+        let replaceAfter = (flashPri >= 2 && lastFlashPriority >= 2) ? kProseRefreshS : dwell
+        let canReplace = flashPri > lastFlashPriority || proseRefresh || held >= dwell
+        if state.mode == .working, !state.aggregate, flashPri >= 1, !state.preview.isEmpty,
+           commentaryKey != lastCommentaryKey, !alreadyShown, canReplace {
+            logDecision("TRIGGER pri=\(flashPri) lastPri=\(lastFlashPriority) held=\(String(format: "%.2f", held)) key=\(flashIdentity.prefix(32)) front=\(front.prefix(6)) '\(state.preview.prefix(28))'")
+            shownFlashKeys.insert(flashIdentity)
+            lastCommentaryKey = commentaryKey
+            lastFlashStartTs = now
+            lastFlashPriority = flashPri
+            state.commentaryMessage = state.preview
+            state.freshCommentaryID = commentaryKey
+        } else if state.mode != .working || state.aggregate {
+            if state.freshCommentaryID != nil || lastFlashPriority != 0 {
+                logDecision("RESET mode=\(state.mode) agg=\(state.aggregate) front=\(front.prefix(6))")
+            }
+            state.freshCommentaryID = nil
+            lastCommentaryKey = ""   // left "working" entirely — next spell starts fresh, even
+            lastFlashPriority = 0    // if its first flash text/priority happens to repeat
+            lastFlashStartTs = 0
+        } else if state.mode == .working, flashPri >= 1, !state.preview.isEmpty,
+                  commentaryKey != lastCommentaryKey, !alreadyShown {
+            // Flash-worthy & fresh, but the current item's dwell hasn't passed — log why held back.
+            logDecision("SUPPRESS pri=\(flashPri) lastPri=\(lastFlashPriority) held=\(String(format: "%.2f", held))/\(String(format: "%.1f", replaceAfter)) key=\(flashIdentity.prefix(32)) front=\(front.prefix(6)) '\(state.preview.prefix(28))'")
         }
 
         // Nothing live, waiting, or errored (all stale / idle) → hide the island entirely.
@@ -3604,21 +3974,28 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     // MARK: - Process scan (liveness + forked filter) — runs on a background queue
 
+    private struct CCSessionInfo {
+        var sessionId = ""
+        var cwd = ""
+        var status = ""
+    }
+
     /// Which Warp tabs still have a live, interactive (non-forked) CC process. Used only
     /// to GC sessions whose tab closed. Pure IO, safe off the main thread.
-    /// Live (non-forked) Warp tabs running claude, mapped to each tab's working
-    /// directory (from the env dump) so a tab with no state file can still be
-    /// labelled by its project name.
-    private func computeLiveTabs() -> (cwds: [String: String], sids: [String: String], focuses: [String: String]) {
+    /// Live (non-forked) terminal tabs running claude, mapped to each tab's working directory
+    /// from Claude's session file (env dump only as fallback) so idle tabs can still be labelled
+    /// by project name.
+    private func computeLiveTabs(_ ccInfos: [String: CCSessionInfo]? = nil) -> (cwds: [String: String], sids: [String: String], focuses: [String: String]) {
         let pids = shell("/usr/bin/pgrep", ["-U", "\(getuid())", "-f", "claude"])
             .split(separator: "\n").map(String.init)
         var cwds = [String: String](), sids = [String: String](), focuses = [String: String]()
         var excluded = Set<String>()
         guard !pids.isEmpty else { return (cwds, sids, focuses) }
+        let cc = ccInfos ?? ccSessionInfos()
         // ONE `ps eww` for the whole pid LIST (env dumps inline per row). A pid list isn't
-        // truncated the way `ps -axeww` is, so we keep the full env — but spawn ps once, not
-        // once per process (was ~15 spawns per 4s scan). `tty=` gives each process's controlling
-        // terminal (for the AppleScript focus target of idle non-Warp tabs).
+        // truncated the way `ps -axeww` is, so we keep the full env — but use it ONLY for terminal
+        // identity. Claude's own ~/.claude/sessions/<pid>.json is the source of truth for cwd /
+        // sessionId/status, which avoids brittle env parsing (especially paths with spaces).
         let dump = shell("/bin/ps", ["eww", "-o", "pid=,tty=,command=", "-p", pids.joined(separator: ",")])
         for raw in dump.split(separator: "\n") {
             let line = String(raw)
@@ -3627,16 +4004,14 @@ final class AppController: NSObject, NSApplicationDelegate {
             let head = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
             guard head.count >= 2 else { continue }
             let pid = String(head[0]); let tty = String(head[1])
-            guard let ident = tabIdentity(line, tty: tty) else { continue }
+            let info = cc[pid]
+            let cwdFromSession = info?.cwd ?? ""
+            let cwd = cwdFromSession.isEmpty ? envCwdIn(line) : cwdFromSession
+            guard let ident = tabIdentity(line, tty: tty, cwd: cwd) else { continue }
             let u = ident.key
-            if cwds[u] == nil { cwds[u] = cwdIn(line) }
+            if cwds[u] == nil { cwds[u] = cwd }
             if focuses[u] == nil { focuses[u] = ident.focus }
-            // CC writes ~/.claude/sessions/<pid>.json with this process's sessionId, so the tab
-            // can resolve its own transcript (and thus its ai-title) even while idle.
-            if sids[u] == nil, !pid.isEmpty,
-               let data = FileManager.default.contents(atPath: kCCSessionsDir + "/" + pid + ".json"),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let sid = obj["sessionId"] as? String { sids[u] = sid }
+            if sids[u] == nil, let sid = info?.sessionId, !sid.isEmpty { sids[u] = sid }
             if line.contains("--fork-session") || line.contains("mcp__computer-use") {
                 excluded.insert(u)   // forked / computer-use session — hide it
             }
@@ -3658,118 +4033,171 @@ final class AppController: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    // Pull " PWD=…" out of the env dump (leading space avoids matching OLDPWD=).
-    // Stops at the next space, so a path with spaces would clip — acceptable.
-    private func cwdIn(_ s: String) -> String {
+    // Fallback only: pull " PWD=…" out of the env dump (leading space avoids matching OLDPWD=).
+    // Stops at the next space, so paths with spaces clip; computeLiveTabs prefers CC's own cwd.
+    private func envCwdIn(_ s: String) -> String {
         guard let r = s.range(of: " PWD=") else { return "" }
         return String(s[r.upperBound...].prefix { $0 != " " })
     }
 
-    /// A canceled turn (Esc) fires no Stop hook, so an active session can get stuck showing
-    /// thinking/working. Claude Code writes "Request interrupted by user" (a user-type entry)
-    /// when that happens. But ANSWERING an AskUserQuestion can also leave that marker — the
-    /// difference is the agent then RESUMES, appending real assistant content after it. So the
-    /// turn is abandoned only if the marker is the last meaningful entry: scan newest→oldest and
-    /// return true at the marker, false the moment we hit real assistant content first.
+    private struct TranscriptSignals {
+        var activity: (preview: String, verb: String, thinking: Bool, flashPri: Int, flashKey: String)?
+        var interrupted = false
+        var apiError: String?
+        var awaySummary: String?
+    }
+
+    private func contentText(_ content: Any?) -> String {
+        if let str = content as? String { return str }
+        if let arr = content as? [[String: Any]] {
+            return arr.compactMap { $0["text"] as? String }.joined(separator: " ")
+        }
+        return ""
+    }
+
+    private func realUserText(_ content: Any?) -> String {
+        let text = contentText(content).split { $0.isWhitespace || $0.isNewline }.joined(separator: " ")
+        guard !text.isEmpty else { return "" }
+        let skipPrefixes = ["<command-", "<local-command", "<system-reminder", "<task-notification",
+                            "Caveat:", "[Request interrupted"]
+        if skipPrefixes.contains(where: { text.hasPrefix($0) }) { return "" }
+        let skipContains = ["</tool-use-id>", "<tool-use-id>", "<output-file>", "<task-id>", "<task-notification"]
+        if skipContains.contains(where: { text.contains($0) }) { return "" }
+        return text
+    }
+
+    private func hasRealAssistantContent(_ content: [[String: Any]]) -> Bool {
+        content.contains { b in
+            switch b["type"] as? String {
+            case "tool_use", "thinking": return true
+            case "text": return !(((b["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            default: return false
+            }
+        }
+    }
+
+    /// One transcript-tail pass for all live signals. This keeps the sub-second poll cheap and
+    /// makes interruption/API-error/activity decisions agree on the same recent transcript view.
     /// File IO, safe off the main thread.
-    private func transcriptInterrupted(_ path: String) -> Bool {
-        guard let fh = FileHandle(forReadingAtPath: path) else { return false }
-        defer { try? fh.close() }
-        let size = fh.seekToEndOfFile()
-        fh.seek(toFileOffset: size > 8192 ? size - 8192 : 0)
-        guard let s = String(data: fh.readDataToEndOfFile(), encoding: .utf8) else { return false }
-        for line in s.split(separator: "\n").reversed() {
-            guard let d = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
-            switch obj["type"] as? String {
-            case "user":
-                // The marker lives in a user entry's content (string or text blocks).
-                let c = (obj["message"] as? [String: Any])?["content"]
-                let text: String
-                if let str = c as? String { text = str }
-                else if let arr = c as? [[String: Any]] { text = arr.compactMap { $0["text"] as? String }.joined(separator: " ") }
-                else { text = "" }
-                if text.contains("Request interrupted by user") { return true }
-            case "assistant":
-                // Any real block (text/tool_use/thinking) after the marker → the turn resumed.
-                if let content = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]],
-                   content.contains(where: { b in
-                       switch b["type"] as? String {
-                       case "tool_use", "thinking": return true
-                       case "text": return !(((b["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                       default: return false
-                       }
-                   }) {
-                    return false
-                }
-            default: break
-            }
-        }
-        return false
-    }
-
-    /// A live API / connection error (overloaded 529, 500, rate-limit, auth 401, dropped
-    /// connection) lands in the transcript as an assistant entry flagged `isApiErrorMessage`,
-    /// with human-readable text. No hook fires for it, so the daemon surfaces it: returns the
-    /// message if it's the latest meaningful assistant entry, nil once the agent recovers (a
-    /// normal assistant block appears after it). Same newest→oldest scan as transcriptInterrupted.
-    private func transcriptApiError(_ path: String) -> String? {
-        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { try? fh.close() }
-        let size = fh.seekToEndOfFile()
-        fh.seek(toFileOffset: size > 8192 ? size - 8192 : 0)
-        guard let s = String(data: fh.readDataToEndOfFile(), encoding: .utf8) else { return nil }
-        for line in s.split(separator: "\n").reversed() {
-            guard let d = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  obj["type"] as? String == "assistant",
-                  let msg = obj["message"] as? [String: Any] else { continue }
-            let content = msg["content"]
-            let text: String
-            if let arr = content as? [[String: Any]] { text = arr.compactMap { $0["text"] as? String }.joined(separator: " ") }
-            else if let str = content as? String { text = str }
-            else { text = "" }
-            if (obj["isApiErrorMessage"] as? Bool ?? false) || (msg["isApiErrorMessage"] as? Bool ?? false) {
-                let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                return String((t.isEmpty ? "API Error" : t).prefix(140))
-            }
-            // A normal assistant block after/instead of the error → recovered, not erroring.
-            if let arr = content as? [[String: Any]],
-               arr.contains(where: { b in
-                   switch b["type"] as? String {
-                   case "tool_use", "thinking": return true
-                   case "text": return !(((b["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                   default: return false
-                   }
-               }) {
-                return nil
-            }
-        }
-        return nil
-    }
-
-    /// A "compacted" row has nothing better than the pre-compact prompt to show until CC's own
-    /// "away summary" recap lands — a plain-English catch-up ("Prepping X, just finished Y,
-    /// waiting on Z") CC injects as a `system`/`away_summary` entry the next time you return to
-    /// the session. It doesn't fire synchronously at compaction, only on that later touch, so
-    /// this returns nil until then and the row keeps its current fallback. A generous tail
-    /// window (unlike the 8K used elsewhere) since a few bulky tool/attachment entries can sit
-    /// between the compact boundary and the recap.
-    private func transcriptAwaySummary(_ path: String) -> String? {
-        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+    private func transcriptSignals(_ path: String) -> TranscriptSignals {
+        var signals = TranscriptSignals()
+        guard let fh = FileHandle(forReadingAtPath: path) else { return signals }
         defer { try? fh.close() }
         let size = fh.seekToEndOfFile()
         fh.seek(toFileOffset: size > 32_768 ? size - 32_768 : 0)
-        guard let s = String(data: fh.readDataToEndOfFile(), encoding: .utf8) else { return nil }
-        for line in s.split(separator: "\n").reversed() {
+        guard let data = try? fh.readToEnd(), let s = String(data: data, encoding: .utf8) else { return signals }
+
+        var textPreview = "", textFlashKey = "", action = "", actionFlashKey = "", verb = "", thinking = false
+        var actionFlashPri = 0
+        var classified = false
+        var interruptResolved = false
+        var apiResolved = false
+
+        scanTail: for line in s.split(separator: "\n").reversed() {
             guard let d = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  obj["type"] as? String == "system",
-                  obj["subtype"] as? String == "away_summary",
-                  let content = obj["content"] as? String, !content.isEmpty else { continue }
-            return content
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
+
+            switch obj["type"] as? String {
+            case "system":
+                if signals.awaySummary == nil,
+                   obj["subtype"] as? String == "away_summary",
+                   let content = obj["content"] as? String, !content.isEmpty {
+                    signals.awaySummary = content
+                }
+
+            case "user":
+                let c = (obj["message"] as? [String: Any])?["content"]
+                if !interruptResolved {
+                    if contentText(c).contains("Request interrupted by user") {
+                        signals.interrupted = true
+                        interruptResolved = true
+                    }
+                }
+                // Activity/prose previews belong only to the current typed turn. Tool results
+                // are transcript "user" rows too, but they are meta or carry tool-use tags; only
+                // real typed text is a turn boundary. Without this guard, a fresh turn with only
+                // tools so far can walk backward into the prior turn and resurrect old prose.
+                if !(obj["isMeta"] as? Bool ?? false), !realUserText(c).isEmpty {
+                    break scanTail
+                }
+
+            case "assistant":
+                guard let msg = obj["message"] as? [String: Any] else { continue }
+                let contentAny = msg["content"]
+                let content = contentAny as? [[String: Any]]
+                let realAssistant = content.map(hasRealAssistantContent) ?? false
+
+                if !apiResolved {
+                    if (obj["isApiErrorMessage"] as? Bool ?? false) || (msg["isApiErrorMessage"] as? Bool ?? false) {
+                        let t = contentText(contentAny).trimmingCharacters(in: .whitespacesAndNewlines)
+                        signals.apiError = String((t.isEmpty ? "API Error" : t).prefix(140))
+                        apiResolved = true
+                    } else if realAssistant {
+                        apiResolved = true
+                    }
+                }
+
+                if !interruptResolved, realAssistant {
+                    interruptResolved = true
+                }
+
+                guard let content else { continue }
+                let eventID = transcriptEventID(obj, fallback: String(line))
+
+                // The latest assistant entry decides the verb (what it's doing right now);
+                // a running tool also yields a concrete action fallback. The preview itself
+                // is chosen after the scan: current-turn prose wins, matching island-hook.py.
+                if !classified, !content.isEmpty {
+                    for idx in stride(from: content.count - 1, through: 0, by: -1) {
+                        let last = content[idx]
+                        guard let type = last["type"] as? String else { continue }
+                        switch type {
+                        case "thinking":
+                            thinking = true
+                            verb = "Thinking"
+                        case "tool_use":
+                            let toolName = last["name"] as? String ?? ""
+                            verb = verbForTool(toolName)
+                            actionFlashPri = flashPriorityForTool(toolName)
+                            let tgt = toolTarget(toolName, last["input"] as? [String: Any] ?? [:])
+                            action = (verb + " " + tgt).trimmingCharacters(in: .whitespaces)
+                            actionFlashKey = "tool:\(eventID):\(toolName):\(idx)"
+                        case "text":
+                            verb = "Responding"
+                        default:
+                            break
+                        }
+                        classified = true
+                        break
+                    }
+                }
+
+                // Prose preview = first line of the most recent non-empty text block in the
+                // current typed turn (may be earlier than the latest tool entry).
+                if textPreview.isEmpty, !content.isEmpty {
+                    for idx in stride(from: content.count - 1, through: 0, by: -1) {
+                        guard (content[idx]["type"] as? String) == "text",
+                              let t = content[idx]["text"] as? String,
+                              !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                        let first = t.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "\n").first ?? ""
+                        textPreview = String(first.prefix(120))
+                        textFlashKey = "text:\(eventID):\(idx)"
+                        break
+                    }
+                }
+
+            default:
+                break
+            }
         }
-        return nil
+
+        if classified || !textPreview.isEmpty {
+            let preview = textPreview.isEmpty ? action : textPreview
+            let flashPri = textPreview.isEmpty ? actionFlashPri : 2
+            let flashKey = textPreview.isEmpty ? actionFlashKey : textFlashKey
+            signals.activity = (preview: preview, verb: verb, thinking: thinking, flashPri: flashPri, flashKey: flashKey)
+        }
+        return signals
     }
 
     /// Rewrite a session file to a terminal Esc state: "declined" (an Esc'd question/permission
@@ -3793,19 +4221,31 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     // MARK: - Live status poll (freshest activity, between hook events)
 
-    /// Map sessionId → CC's live status ("busy"/"idle"), read from Claude Code's own
-    /// per-session state files. CC rewrites these continuously, so this leads our hooks.
+    /// Map pid → CC's live session metadata, read from Claude Code's own per-session state
+    /// files. CC rewrites these continuously, so this is less brittle than scraping env dumps.
     /// Safe off the main thread (small files, plain reads).
-    private func ccSessionStatuses() -> [String: String] {
+    private func ccSessionInfos() -> [String: CCSessionInfo] {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: kCCSessionsDir) else { return [:] }
-        var out: [String: String] = [:]
+        var out: [String: CCSessionInfo] = [:]
         for f in files where f.hasSuffix(".json") {
             guard let data = fm.contents(atPath: kCCSessionsDir + "/" + f),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let sid = obj["sessionId"] as? String,
-                  let st = obj["status"] as? String else { continue }
-            out[sid] = st
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let pid = (f as NSString).deletingPathExtension
+            out[pid] = CCSessionInfo(
+                sessionId: obj["sessionId"] as? String ?? "",
+                cwd: obj["cwd"] as? String ?? "",
+                status: obj["status"] as? String ?? ""
+            )
+        }
+        return out
+    }
+
+    /// Map sessionId → CC's live status ("busy"/"idle").
+    private func ccSessionStatuses(_ ccInfos: [String: CCSessionInfo]? = nil) -> [String: String] {
+        var out: [String: String] = [:]
+        for info in (ccInfos ?? ccSessionInfos()).values where !info.sessionId.isEmpty && !info.status.isEmpty {
+            out[info.sessionId] = info.status
         }
         return out
     }
@@ -3824,6 +4264,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func flashPriorityForTool(_ name: String) -> Int {
+        switch name {
+        case "Edit", "MultiEdit", "Write", "NotebookEdit", "Bash", "WebFetch", "Task":
+            return 1
+        default:
+            return 0
+        }
+    }
+
     /// Concrete object a tool is acting on (file basename / command / pattern), mirroring
     /// the hook so the pill's right side stays specific ("Reading | island.swift").
     private func toolTarget(_ tool: String, _ input: [String: Any]) -> String {
@@ -3837,55 +4286,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Tail the transcript for the *live* activity: the latest assistant entry's final block
-    /// gives the real verb ("Thinking" during an extended-thinking block, else the running
-    /// tool), and the most recent non-empty assistant text is the freshest preview. File IO,
-    /// run off the main thread. Returns nil if nothing usable was found.
-    private func transcriptActivity(_ path: String) -> (preview: String, verb: String, thinking: Bool)? {
-        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { try? fh.close() }
-        let size = fh.seekToEndOfFile()
-        fh.seek(toFileOffset: size > 16_384 ? size - 16_384 : 0)
-        guard let data = try? fh.readToEnd(), let s = String(data: data, encoding: .utf8) else { return nil }
-        var textPreview = "", action = "", verb = "", thinking = false
-        var classified = false
-        for line in s.split(separator: "\n").reversed() {
-            guard let d = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  obj["type"] as? String == "assistant",
-                  let msg = obj["message"] as? [String: Any],
-                  let content = msg["content"] as? [[String: Any]] else { continue }
-            // The very latest assistant entry decides the verb (what it's doing right now);
-            // a running tool also yields a concrete object for the preview.
-            if !classified, let last = content.last(where: { ($0["type"] as? String) != nil }) {
-                switch last["type"] as? String {
-                case "thinking": thinking = true; verb = "Thinking"
-                case "tool_use":
-                    verb = verbForTool(last["name"] as? String ?? "")
-                    let tgt = toolTarget(last["name"] as? String ?? "", last["input"] as? [String: Any] ?? [:])
-                    action = (verb + " " + tgt).trimmingCharacters(in: .whitespaces)   // "Reading island.swift"
-                case "text":     verb = "Responding"
-                default:         break
-                }
-                classified = true
-            }
-            // Fallback preview = first line of the most recent non-empty text block (may be an
-            // earlier entry than the one that set the verb, e.g. when it's now running a tool).
-            if textPreview.isEmpty {
-                let texts = content.compactMap { ($0["type"] as? String) == "text" ? $0["text"] as? String : nil }
-                if let t = texts.last(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
-                    let first = t.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "\n").first ?? ""
-                    textPreview = String(first.prefix(120))
-                }
-            }
-            if classified && !textPreview.isEmpty { break }
-        }
-        if !classified && textPreview.isEmpty { return nil }
-        // Tool action (concrete object) wins for the preview; otherwise the latest text.
-        return (action.isEmpty ? textPreview : action, verb, thinking)
-    }
-
-    /// Fires ~2×/sec. Reconciles each known session against CC's live busy/idle status and
+    /// Fires sub-second while a turn is active. Reconciles each known session against CC's live busy/idle status and
     /// the transcript tail, so the pill reflects real activity without waiting for a hook.
     /// Deliberately conservative: attention/error/compacting/compacted are hook-owned and
     /// never overridden here (avoids re-introducing false "waiting for input").
@@ -3911,15 +4312,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let statuses = self.ccSessionStatuses()
-            var acts: [String: (preview: String, verb: String, thinking: Bool)] = [:]
-            var interrupted = Set<String>()
-            var apiErrors: [String: String] = [:]
-            var awaySummaries: [String: String] = [:]
+            var transcriptSignals: [String: TranscriptSignals] = [:]
             for (uuid, _, tx) in snap {
-                if let a = self.transcriptActivity(tx) { acts[uuid] = a }
-                if self.transcriptInterrupted(tx) { interrupted.insert(uuid) }
-                if let e = self.transcriptApiError(tx) { apiErrors[uuid] = e }
-                if let away = self.transcriptAwaySummary(tx) { awaySummaries[uuid] = away }
+                transcriptSignals[uuid] = self.transcriptSignals(tx)
             }
             DispatchQueue.main.async {
                 var changed = false
@@ -3927,6 +4322,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                 let activeModes: Set<String> = ["working", "thinking", "struggling", "error"]
                 for (uuid, sessionId, _) in snap {
                     guard let s = self.sessions[uuid] else { continue }
+                    let signals = transcriptSignals[uuid] ?? TranscriptSignals()
                     // A hook already moved this session on since we started scanning — our
                     // snapshot predates that update, so don't let it clobber the fresher state.
                     // (See the staleness note above pollLiveStatus.)
@@ -3934,17 +4330,24 @@ final class AppController: NSObject, NSApplicationDelegate {
                     // A live API/connection error is the top-priority signal: show red with the
                     // message while it persists, and let it auto-clear (below) once the agent
                     // recovers. The daemon fully owns this state — no hook fires for it.
-                    if let err = apiErrors[uuid] {
+                    if let err = signals.apiError {
                         if s.mode != "error" || s.preview != err {
                             s.mode = "error"; s.detail = "API Error"; s.preview = err; s.ts = now; changed = true
                         }
                         continue
                     }
                     // Hook-owned states we never override here (avoids re-introducing false
-                    // "waiting for input"). NOTE: "error" is intentionally NOT protected — it's
+                    // "waiting for input"). Also covers the done-family terminal states: CC's own
+                    // busy/idle status file can still read "busy" for a tick or two after the Stop
+                    // hook already froze `done`'s ts/turnStartTs — without this guard, that stale
+                    // read flips the session back to "working" (resetting turnStartTs to "now"),
+                    // then the next tick flips it back to "done" with a fresh ts, so the timer
+                    // freezes at ~one poll interval — a bogus "Finished 0s" that clobbers the
+                    // hook's real duration. NOTE: "error" is intentionally NOT protected — it's
                     // daemon-owned now, so when apiErrors no longer reports one, the reconcile
                     // below clears it back to working/done.
-                    let protected = (s.mode == "compacting" || s.mode == "compacted" || s.mode == "attention")
+                    let protected = (s.mode == "compacting" || s.mode == "compacted" || s.mode == "attention"
+                                      || s.mode == "done" || s.mode == "declined" || s.mode == "interrupted")
                     if !protected, let st = statuses[sessionId] {
                         if st == "busy" {
                             // Actively computing. Leave thinking/working/struggling (and their
@@ -3959,20 +4362,21 @@ final class AppController: NSObject, NSApplicationDelegate {
                             // response so far — instead of a false "done". (attention is protected
                             // above, so a halted turn here is never a question — that's caught as
                             // "declined" in refreshLiveness.)
-                            if interrupted.contains(uuid) {
+                            if signals.interrupted {
                                 s.mode = "interrupted"; s.ts = now; s.qHeader = ""; s.qText = ""
-                                if let p = acts[uuid]?.preview, !p.isEmpty { s.preview = p }
-                                self.persistTerminal(uuid, mode: "interrupted", preview: acts[uuid]?.preview ?? "")
+                                if let p = signals.activity?.preview, !p.isEmpty { s.preview = p }
+                                self.persistTerminal(uuid, mode: "interrupted", preview: signals.activity?.preview ?? "")
                             } else {
                                 s.mode = "done"; s.ts = now
+                                if s.finishKey.isEmpty { s.finishKey = self.finishFlashKey(uuid, s) }
                             }
                             changed = true
                         }
                     }
                     // A "compacted" row has no preview of its own until CC's own "away summary"
-                    // recap lands (see transcriptAwaySummary) — swap it in over the pre-compact
+                    // recap lands (read by transcriptSignals) — swap it in over the pre-compact
                     // prompt fallback once it shows up.
-                    if s.mode == "compacted", let away = awaySummaries[uuid], !away.isEmpty, s.preview != away {
+                    if s.mode == "compacted", let away = signals.awaySummary, !away.isEmpty, s.preview != away {
                         s.preview = away; changed = true
                     }
                     // Freshest preview while live (cheap; no-op when unchanged). Skip the Esc
@@ -3980,7 +4384,11 @@ final class AppController: NSObject, NSApplicationDelegate {
                     // response-so-far / error message / away-summary, which the transcript tail
                     // would otherwise overwrite with a stale pre-compact action.
                     if s.mode != "declined", s.mode != "interrupted", s.mode != "error", s.mode != "compacted",
-                       let p = acts[uuid]?.preview, !p.isEmpty, s.preview != p { s.preview = p; changed = true }
+                       let activity = signals.activity, !activity.preview.isEmpty {
+                        if s.preview != activity.preview { s.preview = activity.preview; changed = true }
+                        if s.flashPri != activity.flashPri { s.flashPri = activity.flashPri; changed = true }
+                        if s.flashKey != activity.flashKey { s.flashKey = activity.flashKey; changed = true }
+                    }
                 }
                 if changed { self.rebuild() }
             }
@@ -4016,8 +4424,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// dump is inlined). Returns the state-file key — which MUST match what the hook writes, so
     /// it's built from the same per-tab env var the hook keys on — plus a scheme-tagged focus
     /// descriptor. `tty` is the process's tty column (may be "??"; only used to focus idle tabs
-    /// that have no state file). nil → a terminal we don't track per-tab (folds into "local").
-    private func tabIdentity(_ s: String, tty: String) -> (key: String, focus: String)? {
+    /// that have no state file). `cwd` comes from CC's session JSON when available, with env as
+    /// a fallback. nil → a terminal we don't track per-tab (folds into "local").
+    private func tabIdentity(_ s: String, tty: String, cwd: String) -> (key: String, focus: String)? {
         if let r = s.range(of: "WARP_TERMINAL_SESSION_UUID=") {
             let u = s[r.upperBound...].prefix { $0.isHexDigit }
             return u.isEmpty ? nil : (String(u), "warp://session/\(u)")
@@ -4039,8 +4448,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             return ("aterm-" + sid.replacingOccurrences(of: ":", with: "-"), focus)
         }
         if s.contains("TERM_PROGRAM=ghostty"), !dev.isEmpty {
-            // Ghostty is AppleScript-focusable — match its tab by working directory (from the env).
-            let cwd = cwdIn(s)
+            // Ghostty is AppleScript-focusable — match its tab by working directory.
             let focus = cwd.isEmpty ? "app:com.mitchellh.ghostty" : "ghostty:\(cwd)"
             return ("ghostty-" + (dev as NSString).lastPathComponent, focus)
         }
@@ -4055,7 +4463,6 @@ final class AppController: NSObject, NSApplicationDelegate {
             let bundle = cf.isEmpty ? (isCursor ? "com.todesktop.230313mzl4w4u92" : "com.microsoft.VSCode") : cf
             // The `code`/`cursor` CLI focuses the window holding this cwd's workspace (no side
             // effects) — a real upgrade over app-activate when several editor windows are open.
-            let cwd = cwdIn(s)
             let focus = cwd.isEmpty ? "app:\(bundle)" : "editor:\(bundle):\(cwd)"
             return ("\(isCursor ? "cursor" : "vscode")-\(base)", focus)
         }
@@ -4108,6 +4515,44 @@ final class AppController: NSObject, NSApplicationDelegate {
         return out.count == 32 ? out : nil
     }
 
+    /// DEBUG: append one line per visible right-slot change to ~/.claude-island/flicker.log —
+    /// wall-clock time, delta since the previous change, and the new content signature — so the
+    /// flicker cadence can be read off precisely. Inert unless the sentinel ~/.claude-island/
+    /// flicker.on exists (touch it to enable, rm to disable — no rebuild needed).
+    func logFlicker(_ sig: String) {
+        let dir = NSHomeDirectory() + "/.claude-island"
+        guard FileManager.default.fileExists(atPath: dir + "/flicker.on") else { return }
+        let t = CACurrentMediaTime()
+        let dt = lastFlickerT == 0 ? 0 : (t - lastFlickerT)
+        lastFlickerT = t
+        let wall = ISO8601DateFormatter().string(from: Date())
+        let line = String(format: "%@  +%6.3fs  %@\n", wall, dt, sig)
+        let path = dir + "/flicker.log"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+        } else {
+            try? line.write(toFile: path, atomically: false, encoding: .utf8)
+        }
+    }
+
+    /// DEBUG: same log file as logFlicker, but for rebuild()'s flash decisions (TRIGGER/
+    /// SUPPRESS/RESET) — shows WHY the right slot changed, alongside the visible-change lines.
+    func logDecision(_ msg: String) {
+        let dir = NSHomeDirectory() + "/.claude-island"
+        guard FileManager.default.fileExists(atPath: dir + "/flicker.on") else { return }
+        let t = CACurrentMediaTime()
+        let dt = lastFlickerT == 0 ? 0 : (t - lastFlickerT)
+        lastFlickerT = t
+        let wall = ISO8601DateFormatter().string(from: Date())
+        let line = String(format: "%@  +%6.3fs  · %@\n", wall, dt, msg)
+        let path = dir + "/flicker.log"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+        } else {
+            try? line.write(toFile: path, atomically: false, encoding: .utf8)
+        }
+    }
+
     /// Apply a DB-reported active tab. Warp only updates active_tab_index on *manual* tab
     /// switches — a deep-link focus (our row click) doesn't persist there. So we adopt the
     /// DB value only when it actually CHANGES (a real switch); otherwise we keep whatever
@@ -4120,7 +4565,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     /// Re-read the Warp-active tab off-main and rebuild (called when the dropdown opens, so
-    /// the highlight is fresh even between 4s scans).
+    /// the highlight is fresh even between liveness scans).
     func refreshActiveTab() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -4163,13 +4608,14 @@ final class AppController: NSObject, NSApplicationDelegate {
             rebuild()
             return
         }
-        // A "Finished" single-session pill: click just acknowledges it — reset to the neutral
-        // icon + count pill instead of jumping to the tab (you already know it's done). Not a
-        // tab switch, and not the hidden-idle regime — this stays visible. It un-dismisses on
+        // A "Finished" single-session pill: click BOTH focuses its tab AND acknowledges it —
+        // reset to the neutral icon + count pill so it doesn't keep sitting there once you've
+        // seen it, same as any other front-pill click, just also dismissed. It un-dismisses on
         // its own the moment that session does anything new (see `merge()`).
         if s.mode == .done && !s.aggregate, let front = frontUUID {
             dismissedDoneIds.insert(front)
             rebuild()
+            if let f = sessions[front] { openFocus(f.focus) } else { activateWarp() }
             return
         }
         // The front ticker focuses its own tab. The dropdown is opened ONLY by the
@@ -4341,11 +4787,12 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     /// The sub-second live poll runs ONLY while a turn is active (started/stopped from rebuild).
-    /// Idle sessions have nothing to poll, so it no longer wakes the CPU ~2×/sec around the clock.
+    /// Idle sessions have nothing to poll, so it no longer wakes the CPU around the clock.
     private func startLivePoll() {
         guard liveTimer == nil else { return }
-        let t = Timer(timeInterval: 0.6, repeats: true) { [weak self] _ in self?.pollLiveStatus() }
-        t.tolerance = 0.2
+        pollLiveStatus()
+        let t = Timer(timeInterval: kLivePollIntervalS, repeats: true) { [weak self] _ in self?.pollLiveStatus() }
+        t.tolerance = kLivePollToleranceS
         RunLoop.main.add(t, forMode: .common)
         liveTimer = t
     }
@@ -4421,6 +4868,20 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// island-statusline.py and keyed by session_id (the transcript's basename). This is
     /// computed against the session's ACTUAL window — model- and 1M-beta-aware — so it's used in
     /// preference to the daemon's 200k/1M token-count heuristic. nil when not yet captured.
+    /// A session's context-window fill (0…1) for the ring. Prefers CC's per-session statusline %
+    /// (its REAL window — model/1M-beta aware) over the daemon's token-count guess — EXCEPT right
+    /// after a compaction. There the statusline % is stale-HIGH: its most recent sample was the
+    /// summarization call, which ingested the FULL pre-compaction context, and CC re-runs the
+    /// statusline post-compaction so the ctx file is freshly written yet still high (a timestamp
+    /// check wouldn't catch it). The hook forces v.context=0 for exactly this "compacted" window
+    /// (island-hook.py, sessionstart/source=compact), so honor that authoritative signal until
+    /// the next real turn refreshes both. v.mode stays "compacted" until that turn, so this also
+    /// covers a compacted session that goes stale before the user returns to it.
+    private func sessionContext(_ v: LiveSession) -> Double {
+        if v.mode == "compacted" { return v.context }
+        return statuslineContext(v.transcript) ?? v.context
+    }
+
     private func statuslineContext(_ transcript: String) -> Double? {
         guard transcript.hasSuffix(".jsonl") else { return nil }
         let sid = String((transcript as NSString).lastPathComponent.dropLast(6))   // ".jsonl"
@@ -4534,6 +4995,7 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     struct GitInfo: Equatable { var repo = ""; var branch = ""; var files = 0; var added = 0; var removed = 0 }
     private var gitCache: [String: GitInfo] = [:]   // cwd → its repo/branch/churn
+    private var gitProbeSeen = Set<String>()        // includes non-git dirs, so missing dirs probe once immediately
     private var lastGitCompute = 0.0
     private var gitProbing = false
 
@@ -4591,7 +5053,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// keep `git` off the hot path. On a real change it triggers one rebuild to repaint.
     private func refreshGitInfo(_ cwds: Set<String>) {
         let now = Date().timeIntervalSince1970
-        guard IslandState.shared.dropdownOpen, !gitProbing, now - lastGitCompute > 3, !cwds.isEmpty else { return }
+        let hasUnseenCwd = cwds.contains { !gitProbeSeen.contains($0) }
+        guard IslandState.shared.dropdownOpen, !gitProbing, !cwds.isEmpty,
+              hasUnseenCwd || now - lastGitCompute > 3 else { return }
         gitProbing = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
@@ -4600,6 +5064,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 var changed = false
                 for (k, v) in fresh where self.gitCache[k] != v { self.gitCache[k] = v; changed = true }
+                self.gitProbeSeen.formUnion(cwds)
                 self.lastGitCompute = Date().timeIntervalSince1970
                 self.gitProbing = false
                 if changed { self.rebuild() }

@@ -13,7 +13,7 @@ session's file via `island-send` (which posts the Darwin ping the daemon listens
 Usage: island-hook.py <prompt|tool|post|attention|stop|compact|sessionstart>
 Debug: ISLAND_HOOK_DRYRUN=1 prints "<path>\n<json>" instead of spawning island-send.
 """
-import json, os, re, sys, subprocess, time, random
+import hashlib, json, os, re, sys, subprocess, time, random
 
 EVENT = sys.argv[1] if len(sys.argv) > 1 else ""
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -195,37 +195,25 @@ def compute_firstprompt(transcript):
     return ""
 
 
-def tool_preview(d, entries):
-    """Right-side action: Claude's latest commentary this turn, else '<verb> <target>' from the
-    tool about to run (file / command / pattern)."""
-    # Prefer Claude's own prose. Claude Code writes each content block as its OWN transcript entry
-    # — a turn is a run of separate assistant lines like [thinking], [text "Let me check X"],
-    # [tool_use Read], then a [tool_result] user line — so the narration is NOT in the latest
-    # (tool-only) entry. Walk back through the current turn, skipping thinking / tool-only assistant
-    # lines and tool_result/meta user lines, to the most recent assistant text block. Stop at a real
-    # typed user prompt (the turn boundary) so we never surface prose from an earlier turn.
-    last_text = ""
-    for e in reversed(entries):
-        t = e.get("type")
-        if t == "user":
-            if e.get("isMeta"):
-                continue   # tool_result / system-injected — not a turn boundary
-            if real(user_text((e.get("message") or {}).get("content", ""))):
-                break       # a genuine prompt: end of this turn, stop here
-            continue
-        if t != "assistant":
-            continue
-        c = (e.get("message") or {}).get("content", "")
-        if isinstance(c, list):
-            texts = [b.get("text", "") for b in c
-                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()]
-            if texts:
-                last_text = texts[-1]
-                break
-    if last_text.strip():
-        return last_text.strip().split("\n")[0][:60]
-    tool = d.get("tool_name", "")
-    ti = d.get("tool_input", {}) or {}
+# Tools whose "<verb> <target>" label is worth flashing on the front pill on its own (real
+# progress signals: it wrote/edited a file, ran a command, fetched, delegated). The rest
+# (Read/Grep/Glob/TodoWrite/WebSearch) are routine exploration — still shown as the grey
+# preview, but they never trigger the front-pill flash, which was the "it keeps flashing grep"
+# noise. Claude's own prose always outranks either (see tool_preview's priority return).
+NOTABLE_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit", "Bash", "WebFetch", "Task")
+
+
+def short_hash(s):
+    return hashlib.sha1((s or "").encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def event_ident(e):
+    return (e.get("uuid") or e.get("id") or e.get("timestamp")
+            or short_hash(json.dumps(e, sort_keys=True, default=str)))
+
+
+def tool_label_and_target(tool, ti):
+    ti = ti or {}
     base = lambda p: os.path.basename(p) if p else ""
     if tool in ("Edit", "MultiEdit", "Write", "Read"):
         tgt = base(ti.get("file_path", ""))
@@ -243,6 +231,84 @@ def tool_preview(d, entries):
              "Task": "Delegating", "WebFetch": "Fetching", "WebSearch": "Searching",
              "TodoWrite": "Planning"}.get(tool, tool)
     return (label + " " + tgt).strip()
+
+
+def tool_preview(d, entries):
+    """Right-side action: Claude's latest commentary this turn, else '<verb> <target>' from the
+    tool about to run (file / command / pattern). Returns (text, flash_pri, flash_key) where
+    flash_pri ranks how much the front pill should flash this: 2 = Claude's own prose, 1 = a
+    notable action (NOTABLE_TOOLS), 0 = routine exploration (shown as preview text, but never
+    flashed). The stable flash_key is derived from the transcript row, so hook and poll agree."""
+    # Prefer Claude's own prose. Claude Code writes each content block as its OWN transcript entry
+    # — a turn is a run of separate assistant lines like [thinking], [text "Let me check X"],
+    # [tool_use Read], then a [tool_result] user line — so the narration is NOT in the latest
+    # (tool-only) entry. Walk back through the current turn, skipping thinking / tool-only assistant
+    # lines and tool_result/meta user lines, to the most recent assistant text block. Stop at a real
+    # typed user prompt (the turn boundary) so we never surface prose from an earlier turn.
+    last_text = ""
+    text_key = ""
+    tool_text = ""
+    tool_pri = 0
+    tool_key = ""
+    for e in reversed(entries):
+        t = e.get("type")
+        if t == "user":
+            if e.get("isMeta"):
+                continue   # tool_result / system-injected — not a turn boundary
+            if real(user_text((e.get("message") or {}).get("content", ""))):
+                break       # a genuine prompt: end of this turn, stop here
+            continue
+        if t != "assistant":
+            continue
+        c = (e.get("message") or {}).get("content", "")
+        if isinstance(c, list):
+            eid = event_ident(e)
+            if not tool_key:
+                for i in range(len(c) - 1, -1, -1):
+                    b = c[i]
+                    if not isinstance(b, dict) or b.get("type") != "tool_use":
+                        continue
+                    tool = b.get("name", "") or ""
+                    tool_text = tool_label_and_target(tool, b.get("input", {}) or {})
+                    tool_pri = 1 if tool in NOTABLE_TOOLS else 0
+                    tool_key = "tool:%s:%s:%d" % (eid, tool, i)
+                    break
+            for i in range(len(c) - 1, -1, -1):
+                b = c[i]
+                if not isinstance(b, dict) or b.get("type") != "text":
+                    continue
+                text = b.get("text", "")
+                if text.strip():
+                    last_text = text
+                    text_key = "text:%s:%d" % (eid, i)
+                    break
+            if last_text:
+                break
+    if last_text.strip():
+        return last_text.strip().split("\n")[0][:120], 2, text_key
+    tool = d.get("tool_name", "")
+    ti = d.get("tool_input", {}) or {}
+    if tool_key:
+        return tool_text, tool_pri, tool_key
+    fallback_id = d.get("tool_use_id") or d.get("id") or short_hash(
+        tool + json.dumps(ti, sort_keys=True, default=str) + str(d.get("timestamp") or d.get("ts") or "")
+    )
+    return tool_label_and_target(tool, ti), (1 if tool in NOTABLE_TOOLS else 0), "tool:%s:%s:0" % (fallback_id, tool)
+
+
+def finish_key(message, entries, transcript):
+    for e in reversed(entries):
+        if e.get("type") != "assistant":
+            continue
+        c = (e.get("message") or {}).get("content", "")
+        if not isinstance(c, list):
+            continue
+        eid = event_ident(e)
+        for i in range(len(c) - 1, -1, -1):
+            b = c[i]
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                return "finish:%s:%d" % (eid, i)
+    return "finish:" + short_hash((transcript or "") + "\n" + (message or ""))
 
 
 def post_error(entries):
@@ -418,11 +484,13 @@ def main():
             pass
 
     def emit(mode, detail, preview="", keep=False, qheader="", qtext="",
-             vw="", vt=0.0, ctx=None):
+             vw="", vt=0.0, ctx=None, flash_pri=0, flash_key="", finish_key=""):
         # keep=True (emit_keep) omits preview/qHeader/qText so the daemon RETAINS the last
         # ones (its merge keeps fields the event omitted) — used for a follow-up Notification
         # on the same pause. A full emit always sends them, so a normal turn clears the prior
         # question. vw/vt carry the held verb word across events (daemon ignores unknown keys).
+        # flash_pri / flash_key: how much this preview should flash and which transcript event it
+        # represents. Preview text is display-only; flash_key is the dedupe identity.
         payload = {
             "mode": mode, "detail": detail, "project": project, "title": title,
             "context": float(context if ctx is None else ctx), "focus": focus, "id": tab,
@@ -433,6 +501,9 @@ def main():
             payload["preview"] = preview or ""
             payload["qHeader"] = qheader
             payload["qText"] = qtext
+            payload["flashPri"] = int(flash_pri)
+            payload["flashKey"] = flash_key or ""
+            payload["finishKey"] = finish_key or ""
         if vw:
             payload["vw"] = vw
             payload["vt"] = float(vt)
@@ -458,7 +529,9 @@ def main():
                  vw=prev_vw, vt=prev_vt)
         elif consec_tool_errors(entries) >= 3:
             # Mid-streak of consecutive tool failures → the agent is stuck; show "Struggling…".
-            emit("struggling", "Struggling…", tool_preview(d, entries), vw=prev_vw, vt=prev_vt)
+            preview, flash_pri, flash_key = tool_preview(d, entries)
+            emit("struggling", "Struggling…", preview, vw=prev_vw, vt=prev_vt,
+                 flash_pri=flash_pri, flash_key=flash_key)
         else:
             # Hold the verb for VERB_HOLD_S, then re-pick — matches Claude Code's own spinner
             # cadence and stops the per-tool flicker.
@@ -466,7 +539,9 @@ def main():
                 vw, vt = prev_vw, prev_vt
             else:
                 vw, vt = random.choice(GERUNDS), ts
-            emit("working", vw + "…", tool_preview(d, entries), vw=vw, vt=vt)
+            preview, flash_pri, flash_key = tool_preview(d, entries)
+            emit("working", vw + "…", preview, vw=vw, vt=vt,
+                 flash_pri=flash_pri, flash_key=flash_key)
 
     elif EVENT == "post":
         err = post_error(entries)
@@ -508,7 +583,8 @@ def main():
 
     elif EVENT == "stop":
         # The Stop payload carries the full final message — reliable, no transcript race.
-        emit("done", "", d.get("last_assistant_message", "") or "", vw=prev_vw, vt=prev_vt)
+        msg = d.get("last_assistant_message", "") or ""
+        emit("done", "", msg, vw=prev_vw, vt=prev_vt, finish_key=finish_key(msg, entries, transcript))
 
     elif EVENT == "compact":
         # PreCompact: transcript is about to be compacted. Show "Compacting…" until it finishes.

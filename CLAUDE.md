@@ -4,10 +4,11 @@ Notch live-activity for Claude Code (macOS). Deep reference: `src/island/ARCHITE
 
 ## Build
 ```bash
-pkill -x island; sleep 0.3; node bin/cli.js install
+node bin/cli.js install --no-hooks
 ```
-- `pkill -x island` first is required — the KeepAlive daemon locks its binary, else `swiftc` fails with "text file busy" (reported as "Compilation failed").
-- The trailing "Auto-configure hooks? (Y/n)" prompt is safe to ignore; binary + hook are already in place by then.
+- No manual `pkill` needed. The installer compiles/signs a staged `.app` in tmp first, then unloads the LaunchAgent only for the final app swap/relaunch. If launch fails, it rolls back to the previous app.
+- Use `--no-hooks` for normal rebuilds so Claude settings are left alone. Use `--yes` for first install / hook refresh, or run interactively.
+- If macOS asks for file/automation permissions after every rebuild, ad-hoc signing is the cause. Create/use a persistent local Code Signing identity named `Claude Island Local`, or set `CLAUDE_ISLAND_CODESIGN_IDENTITY` before install.
 - Compile-only check (no install/kill): `swiftc -O -o /tmp/x src/island/island.swift -framework Cocoa -framework SwiftUI 2>&1 | grep -i error` (empty = clean). Ignore `+`/`onChange` deprecation warnings.
 - Other: `node bin/cli.js test` (cycle states), `uninstall`.
 
@@ -21,7 +22,7 @@ The island is a non-activating `NSPanel`: SwiftUI's animation clock doesn't tick
 - `Spinner`'s `.attention`/`.done` cases are mostly unused for the pill — editing it won't change the visible `!`.
 
 ## Add a per-session field (thread all 6)
-`island-hook.sh` (extract from transcript; add to **both** `emit` and `emit_keep`) → `SessionFile` → `LiveSession` → `merge` → `makeCard` → `SessionCard`.
+`island-hook.py` (extract from transcript; add to **both** full emits and keep emits when retention matters) → `SessionFile` → `LiveSession` → `merge` → `makeCard` → `SessionCard`.
 
 ## Inspect state
 - `~/.claude-island/sessions/<tabUUID>.json` — exact payload the daemon reads.

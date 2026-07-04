@@ -8,16 +8,30 @@ npx claude-code-island install
 
 > Requires a Mac with a notch (macOS 13+) and Xcode Command Line Tools (`xcode-select --install`).
 
-<!-- TODO: replace with a real screenshot / gif of the pill + dropdown -->
-![claude-code-island in the notch](docs/screenshot.png)
+![claude-code-island in the notch](assets/dropdown-context-ring-with-git.png)
 
 ## Every session at a glance
 
 Run Claude Code in five tabs and the notch pill becomes a fleet dashboard — it tallies how many sessions are working, waiting on you, or done. Open the dropdown and each one is its own row, grouped by repo and branch, with its live verb, turn timer, and context-window fill.
 
+![Fleet tally with sessions needing input](assets/agent-input-needed.png)
+
 ## Live status, not just a "done" ping
 
-The pill shows a spinner while Claude thinks or runs a tool, turns amber the moment a session needs your input, and settles to a green ✻ when it finishes. The full taxonomy is color-coded in real time: thinking, working, waiting for input, compacting, struggling (a run of tool errors), interrupted/declined (you hit Esc), and API errors.
+The pill shows a spinner while Claude thinks or runs a tool, turns red the moment a session needs your input, and settles to a green ✻ when it finishes. The full taxonomy is color-coded in real time: thinking, working, waiting for input, compacting, struggling (a run of tool errors), interrupted/declined (you hit Esc), and API errors.
+
+![Thinking, amber spinner](assets/thinking.png)
+*Thinking…*
+
+![Working, live verb + timer](assets/agent-working.png)
+*Working, with its live verb and turn timer.*
+
+![Finished, green with reply preview](assets/finished-with-peek.png)
+*Finished — green ✻, frozen turn timer, and a peek at the reply.*
+
+Type "ultrathink" and the verb goes rainbow, letter by letter:
+
+![Ultrathinking, rainbow gradient verb](assets/ultrathinking.png)
 
 ## Click to jump back to the exact tab
 
@@ -27,9 +41,13 @@ Clicking a session focuses the precise terminal tab it's running in — not just
 
 Warp, iTerm2, Apple Terminal, Ghostty, Cursor, and VS Code are all detected automatically. When you're running Claude in more than one app at once, each dropdown row is tagged with that app's icon, so a Warp session reads differently from a Cursor one at a glance.
 
+![Dropdown rows tagged with each terminal app's icon](assets/dropdown-multi-terminal-icon.png)
+
 ## Token and context awareness
 
 Every session carries a ring showing how full its context window is, so you can see who's about to compact. Hover the notch itself for a peek at your token-usage windows — the last 5 hours, today, and this week — without leaving what you're doing.
+
+![Hover peek showing session-limit usage](assets/session-limits.png)
 
 ## Supported terminals
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-const { execSync, spawn } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const readline = require("readline");
 
@@ -20,6 +21,7 @@ const PLIST_LABEL = "com.claude-island.app";
 const PLIST_PATH = path.join(LAUNCH_AGENTS, `${PLIST_LABEL}.plist`);
 const EVENT_DIR = path.join(HOME, ".claude-island");
 const VERSION = require("../package.json").version;
+const LOCAL_CODESIGN_NAME = "Claude Island Local";
 
 // Matches hooks owned by this tool or the legacy banner notifier we migrate from.
 const MINE = /claude-island|island-hook|ClaudeNotify|ClaudeCodeNotification|stop-hook/;
@@ -94,20 +96,8 @@ function spinner(msg) {
   };
 }
 
-// ── Install ─────────────────────────────────────────────────────────────
-
-async function install() {
-  console.log(LOGO);
-  hr();
-  log();
-
-  // Step 1: Build
-  log(`${c.dim}Step 1 of 3${c.reset}  ${c.white}Build${c.reset}`);
-  log();
-
-  fs.mkdirSync(MACOS_DIR, { recursive: true });
-
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+function appPlist() {
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -123,31 +113,135 @@ async function install() {
     <true/>
 </dict>
 </plist>`;
-  fs.writeFileSync(path.join(APP_PATH, "Contents", "Info.plist"), plist);
+}
 
+function launchAgentPlist() {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${path.join(MACOS_DIR, "island")}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>`;
+}
+
+function findLocalCodesignIdentity() {
+  try {
+    const out = execFileSync("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.includes(`"${LOCAL_CODESIGN_NAME}"`) ? LOCAL_CODESIGN_NAME : "";
+  } catch {
+    return "";
+  }
+}
+
+function codesignIdentity() {
+  return process.env.CLAUDE_ISLAND_CODESIGN_IDENTITY || findLocalCodesignIdentity() || "-";
+}
+
+function signApp(appPath) {
+  const identity = codesignIdentity();
+  execFileSync("/usr/bin/codesign", ["--force", "--deep", "--sign", identity, appPath], { stdio: "pipe" });
+  return identity;
+}
+
+function moveDir(src, dest) {
+  try {
+    fs.renameSync(src, dest);
+  } catch (e) {
+    if (e.code !== "EXDEV") throw e;
+    fs.cpSync(src, dest, { recursive: true });
+    fs.rmSync(src, { recursive: true, force: true });
+  }
+}
+
+function stopAgent() {
+  const uid = process.getuid();
+  try { execFileSync("/bin/launchctl", ["bootout", `gui/${uid}/${PLIST_LABEL}`], { stdio: "pipe" }); } catch {}
+  try { execFileSync("/bin/launchctl", ["unload", "-w", PLIST_PATH], { stdio: "pipe" }); } catch {}
+}
+
+function startAgent() {
+  const uid = process.getuid();
+  try {
+    execFileSync("/bin/launchctl", ["bootstrap", `gui/${uid}`, PLIST_PATH], { stdio: "pipe" });
+    return true;
+  } catch {
+    try {
+      execFileSync("/bin/launchctl", ["load", "-w", PLIST_PATH], { stdio: "pipe" });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function buildStagedApp() {
+  const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-island-build-"));
+  const stagedApp = path.join(stageRoot, "ClaudeIsland.app");
+  const stagedMacOS = path.join(stagedApp, "Contents", "MacOS");
+
+  fs.mkdirSync(stagedMacOS, { recursive: true });
+  fs.writeFileSync(path.join(stagedApp, "Contents", "Info.plist"), appPlist());
+
+  execFileSync("swiftc", ["-O", "-o", path.join(stagedMacOS, "island"), ISLAND_SRC, "-framework", "Cocoa", "-framework", "SwiftUI"], { stdio: "pipe" });
+  execFileSync("swiftc", ["-O", "-o", path.join(stagedMacOS, "island-send"), SEND_SRC, "-framework", "Foundation"], { stdio: "pipe" });
+
+  const hookDest = path.join(stagedMacOS, "island-hook.py");
+  fs.copyFileSync(HOOK_SRC, hookDest);
+  fs.chmodSync(hookDest, 0o755);
+
+  const statuslineDest = path.join(stagedMacOS, "island-statusline.py");
+  fs.copyFileSync(STATUSLINE_SRC, statuslineDest);
+  fs.chmodSync(statuslineDest, 0o755);
+
+  const signedWith = signApp(stagedApp);
+  return { stageRoot, stagedApp, signedWith };
+}
+
+// ── Install ─────────────────────────────────────────────────────────────
+
+async function install() {
+  console.log(LOGO);
+  hr();
+  log();
+
+  // Step 1: Build
+  log(`${c.dim}Step 1 of 3${c.reset}  ${c.white}Build${c.reset}`);
+  log();
+
+  let staged = null;
   const sp = spinner("Compiling native app...\n");
   try {
-    execSync(`swiftc -O -o "${path.join(MACOS_DIR, "island")}" "${ISLAND_SRC}" -framework Cocoa -framework SwiftUI`, { stdio: "pipe" });
-    execSync(`swiftc -O -o "${path.join(MACOS_DIR, "island-send")}" "${SEND_SRC}" -framework Foundation`, { stdio: "pipe" });
+    staged = buildStagedApp();
     sp.stop("Compiled daemon + sender");
   } catch (e) {
     sp.fail("Compilation failed");
+    if (staged?.stageRoot) fs.rmSync(staged.stageRoot, { recursive: true, force: true });
     log();
     info("Make sure Xcode Command Line Tools are installed:");
     info("  xcode-select --install");
     process.exit(1);
   }
 
-  const hookDest = path.join(MACOS_DIR, "island-hook.py");
-  fs.copyFileSync(HOOK_SRC, hookDest);
-  fs.chmodSync(hookDest, 0o755);
-
-  const statuslineDest = path.join(MACOS_DIR, "island-statusline.py");
-  fs.copyFileSync(STATUSLINE_SRC, statuslineDest);
-  fs.chmodSync(statuslineDest, 0o755);
-
-  execSync(`codesign --force --deep --sign - "${APP_PATH}"`, { stdio: "pipe" });
-  done("Signed (ad-hoc)");
+  if (staged.signedWith === "-") {
+    done("Signed (ad-hoc)");
+    warn("Ad-hoc signing can make macOS ask for permissions again after each rebuild");
+    info(`Create a local Code Signing identity named "${LOCAL_CODESIGN_NAME}" or set CLAUDE_ISLAND_CODESIGN_IDENTITY to keep permissions stable.`);
+  } else {
+    done(`Signed (${staged.signedWith})`);
+  }
 
   // Step 2: Background agent
   log();
@@ -166,39 +260,44 @@ async function install() {
     }
     done("Copied icons");
   } catch {}
-  const agentPlist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${PLIST_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${path.join(MACOS_DIR, "island")}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-</dict>
-</plist>`;
-  fs.writeFileSync(PLIST_PATH, agentPlist);
+  fs.mkdirSync(APP_DIR, { recursive: true });
+  fs.writeFileSync(PLIST_PATH, launchAgentPlist());
   done("Installed LaunchAgent (auto-starts on login)");
 
-  // (Re)load the agent.
-  const uid = process.getuid();
-  try { execSync(`launchctl bootout gui/${uid}/${PLIST_LABEL}`, { stdio: "pipe" }); } catch {}
+  // Swap the app only after the staged build is known-good. This keeps the old island
+  // running until the last possible moment, and keeps compile failures from unloading it.
+  const backupPath = fs.existsSync(APP_PATH)
+    ? path.join(APP_DIR, `.ClaudeIsland.previous-${Date.now()}.app`)
+    : "";
+  const swap = spinner("Installing staged app...\n");
   try {
-    execSync(`launchctl bootstrap gui/${uid} "${PLIST_PATH}"`, { stdio: "pipe" });
-    done("Launched — island is live in your notch");
+    stopAgent();
+    if (backupPath) moveDir(APP_PATH, backupPath);
+    moveDir(staged.stagedApp, APP_PATH);
+    fs.rmSync(staged.stageRoot, { recursive: true, force: true });
+    swap.stop("Installed app bundle");
   } catch (e) {
-    // Fallback for older launchctl semantics.
-    try {
-      execSync(`launchctl load -w "${PLIST_PATH}"`, { stdio: "pipe" });
-      done("Launched — island is live in your notch");
-    } catch {
-      warn("Could not auto-launch; it will start on next login");
+    swap.fail("Could not replace the installed app");
+    if (staged?.stageRoot) fs.rmSync(staged.stageRoot, { recursive: true, force: true });
+    if (backupPath && fs.existsSync(backupPath) && !fs.existsSync(APP_PATH)) moveDir(backupPath, APP_PATH);
+    startAgent();
+    log();
+    warn(e.message || String(e));
+    process.exit(1);
+  }
+
+  if (startAgent()) {
+    done("Launched — island is live in your notch");
+    if (backupPath) fs.rmSync(backupPath, { recursive: true, force: true });
+  } else {
+    warn("Could not launch new build; rolling back to previous app");
+    stopAgent();
+    if (backupPath && fs.existsSync(backupPath)) {
+      if (fs.existsSync(APP_PATH)) fs.rmSync(APP_PATH, { recursive: true, force: true });
+      moveDir(backupPath, APP_PATH);
+      if (startAgent()) done("Rolled back and relaunched previous island");
     }
+    process.exit(1);
   }
 
   // Step 3: Hooks
@@ -208,7 +307,17 @@ async function install() {
   log(`${c.dim}Step 3 of 3${c.reset}  ${c.white}Hooks${c.reset}`);
   log();
 
-  const autoConfig = await ask(`Auto-configure Claude Code hooks? ${c.dim}(Y/n)${c.reset} `);
+  const hookDest = path.join(MACOS_DIR, "island-hook.py");
+  const statuslineDest = path.join(MACOS_DIR, "island-statusline.py");
+  let autoConfig = "";
+  if (process.argv.includes("--no-hooks")) {
+    autoConfig = "n";
+    info("Skipping hook configuration (--no-hooks).");
+  } else if (process.argv.includes("--yes") || process.argv.includes("-y")) {
+    autoConfig = "y";
+  } else {
+    autoConfig = await ask(`Auto-configure Claude Code hooks? ${c.dim}(Y/n)${c.reset} `);
+  }
   if (autoConfig.toLowerCase() !== "n") {
     configureHooks(hookDest, statuslineDest);
     done("Updated ~/.claude/settings.json");
@@ -279,6 +388,10 @@ function configureHooks(hookDest, statuslineDest) {
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 function ask(question) {
+  if (!process.stdin.isTTY) {
+    console.log(`  ${c.orange}?${c.reset} ${question}${c.dim}Y${c.reset}`);
+    return Promise.resolve("");
+  }
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) =>
     rl.question(`  ${c.orange}?${c.reset} ${question}`, (ans) => { rl.close(); resolve(ans.trim()); })
@@ -292,9 +405,7 @@ function uninstall() {
   hr();
   log();
 
-  const uid = process.getuid();
-  try { execSync(`launchctl bootout gui/${uid}/${PLIST_LABEL}`, { stdio: "pipe" }); } catch {}
-  try { execSync(`launchctl unload -w "${PLIST_PATH}"`, { stdio: "pipe" }); } catch {}
+  stopAgent();
   if (fs.existsSync(PLIST_PATH)) {
     fs.unlinkSync(PLIST_PATH);
     done("Removed LaunchAgent");
@@ -322,9 +433,14 @@ function uninstall() {
       }
     }
     if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
+    const curStatusLine = settings.statusLine?.command || "";
+    if (/island-statusline|ClaudeIsland/.test(curStatusLine)) {
+      delete settings.statusLine;
+      removed = true;
+    }
     if (removed) {
       fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
-      done("Removed hooks from ~/.claude/settings.json");
+      done("Removed hooks/statusline from ~/.claude/settings.json");
     }
   }
 
@@ -398,6 +514,7 @@ switch (command) {
     log(`${c.white}Usage:${c.reset}`);
     log();
     log(`  ${c.orange}install${c.reset}     Set up the notch island`);
+    log(`  ${c.orange}install --no-hooks${c.reset}  Rebuild/relaunch without touching Claude settings`);
     log(`  ${c.orange}test${c.reset}        Run through the states`);
     log(`  ${c.orange}uninstall${c.reset}   Remove everything`);
     log();

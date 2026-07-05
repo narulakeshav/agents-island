@@ -22,7 +22,9 @@ let kSessionsDir = kEventDir + "/sessions"     // one <tabUUID>.json per live se
 // for whether a session is actually computing right now. Reverse-engineered, no API.
 let kCCSessionsDir = NSString("~/.claude/sessions").expandingTildeInPath
 let kProjectOrderFile = kEventDir + "/project-order"   // persisted dropdown group order (first-seen)
+let kChimeEnabledFile = kEventDir + "/chime-enabled"   // "0" = off, absent/other = on (default)
 let kDarwinName = "com.claude-island.event"
+let kChimeDebounceS: Double = 5.0   // minimum seconds between chimes (global rebound)
 
 // EXPERIMENT: lead each dropdown row with the session's opening user prompt instead of
 // the Warp tab name — the prompt is a far stickier "which convo is this" anchor. Flip to
@@ -2471,7 +2473,11 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem?
     private var pauseMenuItem: NSMenuItem?
+    private var soundMenuItem: NSMenuItem?
     private var paused = false
+    private var chimeEnabled = true       // default on; persisted to ~/.claude-island/chime-enabled
+    private var lastChimeTs: Double = 0   // epoch of last chime (global 5s debounce)
+    private var lastChimedModes: [String: String] = [:]  // uuid → mode at last chime, to detect transitions
 
     /// A menu bar presence — the conventional home for quitting a background utility (a plain
     /// Quit would just be relaunched by the KeepAlive agent) and a persistent "it's installed"
@@ -2484,6 +2490,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         let pause = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
         pause.target = self
         menu.addItem(pause)
+        let sound = NSMenuItem(title: chimeEnabled ? "Sound On" : "Sound Off",
+                               action: #selector(toggleSound), keyEquivalent: "")
+        sound.target = self
+        menu.addItem(sound)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Claude Island", action: #selector(quitIsland), keyEquivalent: "q")
         quit.target = self
@@ -2491,6 +2501,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         item.menu = menu
         statusItem = item
         pauseMenuItem = pause
+        soundMenuItem = sound
     }
 
     /// The notch silhouette as a menu bar template image — the same concave re-entrant shoulder
@@ -2527,6 +2538,23 @@ final class AppController: NSObject, NSApplicationDelegate {
         if paused { panel.orderOut(nil) } else { rebuild() }
     }
 
+    @objc private func toggleSound() {
+        chimeEnabled.toggle()
+        soundMenuItem?.title = chimeEnabled ? "Sound On" : "Sound Off"
+        // Persist: "0" = off, absent = on.
+        try? (chimeEnabled ? "" : "0").write(toFile: kChimeEnabledFile, atomically: true, encoding: .utf8)
+    }
+
+    /// Play the completion chime (macOS "Glass" system sound) if enabled and not within the
+    /// 5s global debounce window. Called on fresh transitions to done/attention.
+    private func playChime() {
+        guard chimeEnabled, !paused else { return }
+        let now = Date().timeIntervalSince1970
+        guard now - lastChimeTs >= kChimeDebounceS else { return }
+        lastChimeTs = now
+        NSSound(named: "Glass")?.play()
+    }
+
     @objc private func quitIsland() {
         // KeepAlive=true would relaunch a plain terminate, so bootout the LaunchAgent — it stays
         // quit until next login (or a reinstall / manual `launchctl bootstrap`).
@@ -2548,6 +2576,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         // dir headers keep their "when first opened" order across daemon restarts.
         if let raw = try? String(contentsOfFile: kProjectOrderFile, encoding: .utf8) {
             projectOrder = raw.split(separator: "\n").map(String.init)
+        }
+
+        // Chime enabled: default ON; file contains "0" to disable.
+        if let raw = try? String(contentsOfFile: kChimeEnabledFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), raw == "0" {
+            chimeEnabled = false
         }
 
         let hosting = ClickableHostingView(rootView: IslandView())
@@ -3843,6 +3877,22 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         // The 1s timer and the sub-second live poll both run ONLY while a turn is active.
         if anyActive { startClock(); startLivePoll() } else { stopClock(); stopLivePoll() }
+
+        // Completion chime: play on fresh transitions to done/attention for ANY session
+        // (front or background). The 5s global debounce in playChime() prevents stacking.
+        let chimeModes: Set<String> = ["done", "attention"]
+        var shouldChime = false
+        for (uuid, session) in vis {
+            let currentMode = effMode(uuid, session)
+            let prevMode = lastChimedModes[uuid]
+            if chimeModes.contains(currentMode), prevMode != currentMode {
+                shouldChime = true
+            }
+            lastChimedModes[uuid] = currentMode
+        }
+        // Clean up stale entries for sessions that are no longer visible.
+        lastChimedModes = lastChimedModes.filter { vis[$0.key] != nil }
+        if shouldChime { playChime() }
 
         // Fleet reducer: tally the roster into the buckets the front pill and (later) the
         // dropdown headers both read. The roster's `status` already bakes in the 15-min

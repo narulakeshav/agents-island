@@ -3986,7 +3986,12 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// from Claude's session file (env dump only as fallback) so idle tabs can still be labelled
     /// by project name.
     private func computeLiveTabs(_ ccInfos: [String: CCSessionInfo]? = nil) -> (cwds: [String: String], sids: [String: String], focuses: [String: String]) {
-        let pids = shell("/usr/bin/pgrep", ["-U", "\(getuid())", "-f", "claude"])
+        // Anchored so "claude" must be a whole path/word component (start/end or flanked by
+        // "/" or a space) — a bare substring match would also catch unrelated long-running
+        // processes like a "claudeisland-slack-bot" dev server, permanently pinning whatever
+        // terminal tab launched it as "live" and resurrecting its last-known session as a
+        // stale card that never ages out.
+        let pids = shell("/usr/bin/pgrep", ["-U", "\(getuid())", "-f", "(^|[/ ])claude([/ ]|$)"])
             .split(separator: "\n").map(String.init)
         var cwds = [String: String](), sids = [String: String](), focuses = [String: String]()
         var excluded = Set<String>()

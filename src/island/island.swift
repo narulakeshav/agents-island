@@ -174,6 +174,18 @@ let kDropdownBottomPad: CGFloat = 6   // padding below the last row, inside the 
 let kRowInset: CGFloat = 14       // row horizontal inset from the sheet edge
 let kFrontPeek: CGFloat = 23      // how far the front pill grows DOWN on hover to show its title (+1 over the text's own height so descenders like "g" don't clip)
 let kFrontExpandRadius: CGFloat = 28  // bottom corner radius while the front pill is expanded
+let kUsagePeekExtra: CGFloat = 26 // extra downward growth when the notch usage-peek adds its activity strip below the text (the hover caption floats, so it costs no height)
+let kUsagePeekReserve: CGFloat = 95 // always-reserved panel height below the island (kFrontPeek + kUsagePeekExtra + float room for the hover tooltip), so the taller usage peek + its floating caption never clip against the window bound
+let kActivityDays = 7             // days shown in the notch usage-peek activity strip (oldest→newest, today rightmost),
+                                  // flanked by "7 days" / "Today" labels
+
+// The notch usage-peek grows an extra row (kUsagePeekExtra) for its activity strip only when
+// the notch is being peeked, a week of data exists, and we're past the first-run teach copy.
+// Both the SwiftUI layout (frontPeekH) and the controller's hover/hit regions read this so the
+// taller peek stays clickable and hover-stable.
+func showsActivityStrip(_ s: IslandState) -> Bool {
+    s.notchPeek && !s.usageDays.isEmpty && !s.firstRunHint
+}
 
 /// One entry in the dropdown: either a project section header or a session row. Headers
 /// appear only when the roster spans more than one project; a single-project list is flat.
@@ -346,6 +358,17 @@ final class IslandState: ObservableObject {
     // "Happy Clauding". "Session" = rolling last 5h (Claude's usage-window length).
     @Published var usageSession = ""
     @Published var usageToday = ""
+    // Per-day token activity for the notch-peek strip: kActivityDays intensity levels (0=idle,
+    // 1…4 brighter), oldest→newest with today rightmost. Shaded relative to the user's own
+    // busiest day in the window (there is no per-day plan quota to measure against). Empty until
+    // first computed, or when the week is idle → the strip hides.
+    @Published var usageDays: [Int] = []
+    // Raw input+output tokens for each of those days (same oldest→newest order), for the
+    // per-day hover caption ("312k tokens · Jun 19").
+    @Published var usageDayTokens: [Int] = []
+    // Which strip cell the cursor is over (0…kActivityDays-1, -1 = none). Hit-tested in the
+    // mouse monitor since SwiftUI's onHover never fires in this non-key panel.
+    @Published var hoveredDay = -1
     // Real plan rate-limit % (from Claude Code's statusline `rate_limits`, captured by
     // island-statusline.py). "47" etc., or "" when unavailable (non-Max, or pre-first-response).
     // The 5h window is what Claude's plans call your "Session"; seven_day is the weekly cap.
@@ -1981,10 +2004,26 @@ struct IslandView: View {
     // "This Week" (7d) is still computed (`rlWeek`) but hidden here — may resurface later.
     @ViewBuilder
     private var usagePeekView: some View {
-        let grey = Color(white: 0.55)
+        // The teach copy stands alone; every other peek stacks the activity strip under its
+        // text line (when we have a week of data to shade).
         if state.firstRunHint {
             Text("👋 Hover the notch anytime to summon me").foregroundColor(.white)
-        } else if !state.rlSession.isEmpty {
+        } else {
+            VStack(spacing: 7) {
+                usagePeekLine
+                if !state.usageDays.isEmpty {
+                    ActivityStrip(levels: state.usageDays, tokens: state.usageDayTokens,
+                                  hovered: state.hoveredDay)
+                }
+            }
+            .padding(.bottom, 3)
+        }
+    }
+
+    @ViewBuilder
+    private var usagePeekLine: some View {
+        let grey = Color(white: 0.55)
+        if !state.rlSession.isEmpty {
             let pct = Int(state.rlSession) ?? 0
             let barColor = pctColor(state.rlSession)
             let textColor = pctTextColor(state.rlSession)
@@ -2005,6 +2044,73 @@ struct IslandView: View {
             sess + Text("  ·  ").foregroundColor(grey) + today
         } else {
             Text("Happy Clauding").foregroundColor(.white)
+        }
+    }
+
+    // GitHub-contributions-style row of per-day cells: brighter = a heavier day for you
+    // (relative to your own busiest day in the window). On the black notch, "more activity"
+    // reads as "whiter", so intensity maps to white opacity; an idle day is a faint grid cell.
+    private struct ActivityStrip: View {
+        let levels: [Int]   // oldest→newest, today rightmost
+        let tokens: [Int]   // raw per-day tokens, same order (may be empty)
+        let hovered: Int    // hit-tested cell index, -1 = none
+        static let cell: CGFloat = 11, gap: CGFloat = 2.5
+        var body: some View {
+            let label = Color(white: 0.5)
+            // The busiest day sets the brightness peak; every other day is shaded by a gamma
+            // curve of its share of that peak (see opacity()).
+            let peak = tokens.max() ?? 0
+            // Inline flanks: "7 days" · cells · "Today". Fixed-width labels keep the cell row
+            // exactly centered under the pill so the hover hit-test lines up.
+            HStack(spacing: 7) {
+                Text("7 days").font(.custom(kSansFontName, size: 11)).foregroundColor(label)
+                    .frame(width: 44, alignment: .leading)
+                HStack(spacing: Self.gap) {
+                    ForEach(Array(levels.enumerated()), id: \.offset) { i, _ in
+                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                            .fill(Color.white.opacity(Self.opacity(i < tokens.count ? tokens[i] : 0, peak: peak)))
+                            .overlay(  // ring the hovered cell so the tooltip's day is obvious
+                                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                    .strokeBorder(Color.white, lineWidth: i == hovered ? 1 : 0))
+                            .frame(width: Self.cell, height: Self.cell)
+                    }
+                }
+                Text("Today").font(.custom(kSansFontName, size: 11)).foregroundColor(label)
+                    .frame(width: 44, alignment: .trailing)
+            }
+            // Floating tooltip: a self-contained chip below the cells, drawn only on hover so it
+            // costs no layout height. Matches the dropdown's compactTooltip (capsule, size 11).
+            .overlay(alignment: .bottom) {
+                if hovered >= 0, hovered < tokens.count {
+                    Text(caption)
+                        .font(.custom(kSansFontName, size: 11)).foregroundColor(.white)
+                        .lineLimit(1).fixedSize()
+                        .padding(.horizontal, 7).padding(.vertical, 4)
+                        .background(Capsule(style: .continuous).fill(Color(white: 0.15)))
+                        .overlay(Capsule(style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 1))
+                        .offset(y: 24)
+                }
+            }
+        }
+        private var caption: String {
+            guard hovered >= 0, hovered < tokens.count else { return " " }
+            let daysAgo = tokens.count - 1 - hovered
+            let cal = Calendar.current
+            let day = cal.date(byAdding: .day, value: -daysAgo, to: cal.startOfDay(for: Date())) ?? Date()
+            let df = DateFormatter(); df.dateFormat = "MMM d"
+            let t = tokens[hovered]
+            let amt = t >= 1_000_000 ? String(format: "%.1fM", Double(t) / 1_000_000)
+                    : t >= 1_000 ? "\(t / 1000)k" : "\(t)"
+            return "\(amt) tokens · \(df.string(from: day))"
+        }
+        // Brightness = gamma curve of the day's share of the busiest day's tokens. The √ (gamma
+        // 0.5) maps token magnitude to PERCEIVED brightness: the peak day → 1.0, a normal day
+        // stays clearly mid-bright, light days lift off the 0.10 idle cell — while a true 4×
+        // spike still reads ~1.6× brighter (linear crushes normal days near idle; log flattens
+        // the top so the spike stops standing out — this is the middle ground).
+        private static func opacity(_ t: Int, peak: Int) -> Double {
+            guard t > 0, peak > 0 else { return 0.10 }   // idle — faint so the grid still reads
+            return 0.28 + 0.72 * pow(Double(t) / Double(peak), 0.5)
         }
     }
 
@@ -2046,7 +2152,10 @@ struct IslandView: View {
 
     // Extra height the front pill takes on hover (0 normally). Suppressed while the
     // dropdown is open — the expanded sheet already names every session there.
-    private var frontPeekH: CGFloat { (state.frontHovered && !state.dropdownOpen) ? kFrontPeek : 0 }
+    private var frontPeekH: CGFloat {
+        guard state.frontHovered && !state.dropdownOpen else { return 0 }
+        return kFrontPeek + (showsActivityStrip(state) ? kUsagePeekExtra : 0)
+    }
 
     // Which states get the sweeping white shimmer on their left verb: the "in progress"
     // ones (thinking / working gerunds / compacting) and, in the multi-session aggregate,
@@ -2648,11 +2757,12 @@ final class AppController: NSObject, NSApplicationDelegate {
                     // token-usage stats; hovering the count text drops the roster list. Idle is a
                     // hidden regime, so once the cursor leaves the notch + pill (dropdown closed)
                     // the pill tucks back away — it isn't a persistent fixture.
-                    let overNotch = !s.dropdownOpen && pointInNotchRegion(p)
+                    let overNotch = !s.dropdownOpen && (pointInNotchRegion(p) || (s.notchPeek && pointInUsagePeekArea(p)))
                     if s.notchPeek != overNotch {
                         s.notchPeek = overNotch
                         if overNotch { refreshUsage() }   // freshen the usage rollup on demand
                     }
+                    updateHoveredDay(p)
                     if s.frontHovered != overNotch { setFrontHover(overNotch) }   // stats strip on notch hover only
                     if !s.dropdownOpen {
                         if pointInFrontPillRight(p) && !overNotch { openDropdown() }
@@ -2665,11 +2775,12 @@ final class AppController: NSObject, NSApplicationDelegate {
                 }
                 // No idle sessions either — the bare "Idle" pill. Still peek the token-usage
                 // stats on the literal notch, same as every other state.
-                let overNotch = pointInNotchRegion(p)
+                let overNotch = pointInNotchRegion(p) || (s.notchPeek && pointInUsagePeekArea(p))
                 if s.notchPeek != overNotch {
                     s.notchPeek = overNotch
                     if overNotch { refreshUsage() }
                 }
+                updateHoveredDay(p)
                 if s.frontHovered != overNotch { setFrontHover(overNotch) }
                 // No idle sessions: the transient "Idle" peek hides once you leave it.
                 let keep = inZone || overIsland
@@ -2694,11 +2805,14 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         // Hovering the literal notch (center) peeks "Happy Clauding" — takes priority over the
         // single-session title peek (which lives on the text to either side of the notch).
-        let overNotch = !s.dropdownOpen && pointInNotchRegion(p)
+        // Hysteresis: the literal notch OPENS the peek; once open, staying anywhere in the
+        // expanded strip HOLDS it so the cursor can reach the day cells (and their captions).
+        let overNotch = !s.dropdownOpen && (pointInNotchRegion(p) || (s.notchPeek && pointInUsagePeekArea(p)))
         if s.notchPeek != overNotch {
             s.notchPeek = overNotch
             if overNotch { refreshUsage() }   // freshen the token-usage peek on demand (60s-throttled)
         }
+        updateHoveredDay(p)
 
         // Front-pill peek: the notch peek, or a single (non-aggregate) session's title on
         // hover. The aggregate never title-peeks — every count routes to the dropdown instead.
@@ -2791,7 +2905,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         var bottom = f.maxY - islandH
         let top = f.maxY
         if s.roster.count >= 1 && s.mode != .idle { right += kAgentsPeek }  // "{n} ⌄" back pill peeks right
-        if s.frontHovered && !s.dropdownOpen { bottom -= kFrontPeek }  // title-peek strip stays clickable
+        if s.frontHovered && !s.dropdownOpen { bottom -= kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0) }  // peek strip stays clickable
         if s.dropdownOpen {
             right = left + curPillWidth + sheetSide     // sheet grows right…
             bottom = f.maxY - (islandH + dropdownContentHeight(s.dropdownItems) + kDropdownVPad + kDropdownBottomPad)  // …and down
@@ -2985,7 +3099,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let center = f.midX + curIslandOffset
         let left = center - curPillWidth / 2
         let right = center + curPillWidth / 2
-        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
+        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0) : 0)
         return p.x >= left && p.x <= right && p.y >= bottom && p.y <= f.maxY
     }
 
@@ -3009,7 +3123,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let notchGap: CGFloat = s.notchWidth + 80   // notchClearance, mirrors IslandView.pillWidth
         let left = center - curPillWidth / 2 + outerPadding + leadingSlot + notchGap
         let right = center + curPillWidth / 2
-        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
+        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0) : 0)
         return p.x >= left && p.x <= right && p.y >= bottom && p.y <= f.maxY
     }
 
@@ -3027,6 +3141,39 @@ final class AppController: NSObject, NSApplicationDelegate {
         let halfW = max(s.notchWidth, 120) / 2
         let bottom = f.maxY - islandH
         return abs(p.x - f.midX) <= halfW && p.y >= bottom && p.y <= f.maxY
+    }
+
+    /// The expanded usage-peek strip below the notch (the text + activity strip + caption).
+    /// Used only to HOLD an already-open notch peek while the cursor drops onto it, so the
+    /// user can reach the day cells — it never opens the peek (that's the literal notch only).
+    private func pointInUsagePeekArea(_ p: NSPoint) -> Bool {
+        let s = IslandState.shared
+        let f = panel.frame
+        let islandH = max(s.notchHeight, 30)
+        let center = f.midX + curIslandOffset
+        let top = f.maxY - islandH
+        let bottom = top - (kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0))
+        return abs(p.x - center) <= curPillWidth / 2 && p.y >= bottom && p.y <= top
+    }
+
+    /// Hit-test the cursor's x against the centered activity-strip cells and publish the
+    /// hovered day (-1 when off the cells). The cell row is centered under the pill, so its
+    /// geometry mirrors ActivityStrip's fixed cell/gap sizes.
+    private func updateHoveredDay(_ p: NSPoint) {
+        let s = IslandState.shared
+        guard s.notchPeek, !s.usageDays.isEmpty, pointInUsagePeekArea(p) else {
+            if s.hoveredDay != -1 { s.hoveredDay = -1 }
+            return
+        }
+        let f = panel.frame
+        let center = f.midX + curIslandOffset
+        let n = s.usageDays.count
+        let cell: CGFloat = 11, pitch: CGFloat = 11 + 2.5
+        let stripW = CGFloat(n) * cell + CGFloat(n - 1) * (pitch - cell)
+        let rel = p.x - (center - stripW / 2)
+        let idx = Int(rel / pitch)
+        let hd = (rel >= 0 && idx >= 0 && idx < n) ? idx : -1
+        if s.hoveredDay != hd { s.hoveredDay = hd }
     }
 
     // ── Aggregate hit-testing: which count the cursor is over ─────────────────────
@@ -3075,7 +3222,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         guard s.aggregate else { return nil }
         let f = panel.frame
         let islandH = max(s.notchHeight, 30)
-        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
+        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0) : 0)
         guard p.y >= bottom, p.y <= f.maxY else { return nil }
         let center = f.midX + curIslandOffset
         let left  = center - curPillWidth / 2
@@ -3395,7 +3542,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         let dropH = s.dropdownOpen ? dropdownContentHeight(s.dropdownItems) + kDropdownVPad + kDropdownBottomPad : 0
         // Always reserve room for the front-pill hover peek so its expand/collapse animates
         // smoothly inside a transparent panel (no resize-on-hover that would clip the spring).
-        let h: CGFloat = max(nh, 30) + 2 + max(dropH, kFrontPeek)
+        // The reserve covers the taller usage peek + its floating day tooltip; the extra height
+        // is transparent and click-through, so it costs nothing when idle.
+        let h: CGFloat = max(nh, 30) + 2 + max(dropH, kUsagePeekReserve)
         let x = screen.frame.midX - w / 2
         let y = screen.frame.maxY - h
         panel.setFrame(NSRect(x: x, y: y, width: w, height: h), display: true)
@@ -4840,6 +4989,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 IslandState.shared.usageSession = u.session
                 IslandState.shared.usageToday = u.today
+                IslandState.shared.usageDays = u.days
+                IslandState.shared.usageDayTokens = u.dayTokens
                 IslandState.shared.rlSession = rl.session
                 IslandState.shared.rlWeek = rl.week
                 IslandState.shared.rlSessionReset = rl.sessionReset
@@ -4902,12 +5053,14 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// reduce to the three windows. Returns "" when the week is empty (peek keeps its fallback).
     /// Only ever runs on the single in-flight background task (guarded by usageComputing), so the
     /// usageFiles cache it mutates is never touched concurrently.
-    private func computeUsage() -> (session: String, today: String) {
+    private func computeUsage() -> (session: String, today: String, days: [Int], dayTokens: [Int]) {
         let fm = FileManager.default
         let base = NSString("~/.claude/projects").expandingTildeInPath
         let now = Date().timeIntervalSince1970
-        let weekAgo = now - 7 * 86_400
-        guard let projects = try? fm.contentsOfDirectory(atPath: base) else { return ("", "") }
+        // Scan far enough back to fill the activity strip (a few days of slack over kActivityDays),
+        // not just the 7d peek windows. Older buckets still land in the per-day strip below.
+        let weekAgo = now - Double(kActivityDays + 1) * 86_400
+        guard let projects = try? fm.contentsOfDirectory(atPath: base) else { return ("", "", [], []) }
         var seen = Set<String>()
         for proj in projects {
             let dir = base + "/" + proj
@@ -4934,15 +5087,38 @@ final class AppController: NSObject, NSApplicationDelegate {
         let h7 = hourNow - 24 * 7
         let hMid = Int(Calendar.current.startOfDay(for: Date()).timeIntervalSince1970 / 3600)
         var t5 = 0, tToday = 0, t7 = 0
+        // Per-day totals for the activity strip: index 0 = oldest day shown, last = today.
+        let cal = Calendar.current
+        let todayStart = cal.startOfDay(for: Date())
+        var dayTok = [Int](repeating: 0, count: kActivityDays)
         for r in usageFiles.values {
-            for (h, tok) in r.hours where h >= h7 {
-                t7 += tok
-                if h >= hMid { tToday += tok }
-                if h >= h5 { t5 += tok }
+            for (h, tok) in r.hours {
+                if h >= h7 {
+                    t7 += tok
+                    if h >= hMid { tToday += tok }
+                    if h >= h5 { t5 += tok }
+                }
+                // Bucket the hour into its local calendar day; drop anything outside the window.
+                let when = Date(timeIntervalSince1970: Double(h) * 3600)
+                let daysAgo = cal.dateComponents([.day], from: cal.startOfDay(for: when), to: todayStart).day ?? Int.max
+                let idx = kActivityDays - 1 - daysAgo
+                if idx >= 0 && idx < kActivityDays { dayTok[idx] += tok }
             }
         }
-        guard t7 > 0 else { return ("", "") }   // nothing in a week → peek keeps its fallback
-        return (Self.fmtTok(t5), Self.fmtTok(tToday))   // wk (t7) still computed; not shown in the peek
+        guard t7 > 0 else { return ("", "", [], []) }   // nothing in a week → peek keeps its fallback
+        // Shade each day relative to the busiest day in the window (no per-day plan quota exists):
+        // idle→0, then quartiles of the max → 1…4. All-idle windows send [] so the strip hides.
+        let maxDay = dayTok.max() ?? 0
+        let days: [Int] = maxDay == 0 ? [] : dayTok.map { t in
+            if t == 0 { return 0 }
+            let r = Double(t) / Double(maxDay)
+            if r > 0.75 { return 4 }
+            if r > 0.50 { return 3 }
+            if r > 0.25 { return 2 }
+            return 1
+        }
+        let dayTokens = maxDay == 0 ? [] : dayTok
+        return (Self.fmtTok(t5), Self.fmtTok(tToday), days, dayTokens)   // wk (t7) still computed; not shown in the peek
     }
 
     /// Parse the bytes [offset…] of one transcript, adding input+output tokens to per-hour buckets.

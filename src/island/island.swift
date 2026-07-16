@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import CoreText
+import CryptoKit
 
 // ─────────────────────────────────────────────────────────────────────────
 // ClaudeIsland — a persistent notch "live activity" for Claude Code.
@@ -102,9 +103,18 @@ func terminalBundleId(focus: String, id: String) -> String? {
     if id.hasPrefix("ghostty-") { return "com.mitchellh.ghostty" }
     if id.hasPrefix("cursor-") { return "com.todesktop.230313mzl4w4u92" }
     if id.hasPrefix("vscode-") { return "com.microsoft.VSCode" }
+    if id.hasPrefix("cdesk-") { return "com.anthropic.claudefordesktop" }
     // A bare hex id with no scheme is a Warp tab (uuid-keyed).
     if !id.isEmpty, id != "local", id.allSatisfy({ $0.isHexDigit }) { return "dev.warp.Warp-Stable" }
     return nil
+}
+
+/// The state-file key for a Claude-desktop-hosted session. MUST match the hook's
+/// `"cdesk-" + short_hash(session_id or cwd)` (short_hash = SHA-1, first 16 hex chars), so the
+/// daemon's process scan and the hook agree on the same card. Desktop CC has no tty to key on.
+func claudeDesktopKey(_ idSource: String) -> String {
+    let hex = Insecure.SHA1.hash(data: Data(idSource.utf8)).map { String(format: "%02x", $0) }.joined()
+    return "cdesk-" + hex.prefix(16)
 }
 
 private var _appIconCache: [String: NSImage] = [:]
@@ -174,18 +184,9 @@ let kDropdownBottomPad: CGFloat = 6   // padding below the last row, inside the 
 let kRowInset: CGFloat = 14       // row horizontal inset from the sheet edge
 let kFrontPeek: CGFloat = 23      // how far the front pill grows DOWN on hover to show its title (+1 over the text's own height so descenders like "g" don't clip)
 let kFrontExpandRadius: CGFloat = 28  // bottom corner radius while the front pill is expanded
-let kUsagePeekExtra: CGFloat = 26 // extra downward growth when the notch usage-peek adds its activity strip below the text (the hover caption floats, so it costs no height)
-let kUsagePeekReserve: CGFloat = 95 // always-reserved panel height below the island (kFrontPeek + kUsagePeekExtra + float room for the hover tooltip), so the taller usage peek + its floating caption never clip against the window bound
+let kUsagePeekReserve: CGFloat = 95 // always-reserved panel height below the island (kFrontPeek + float room for the hover tooltip), so the usage peek + its floating caption never clip against the window bound
 let kActivityDays = 7             // days shown in the notch usage-peek activity strip (oldest→newest, today rightmost),
                                   // flanked by "7 days" / "Today" labels
-
-// The notch usage-peek grows an extra row (kUsagePeekExtra) for its activity strip only when
-// the notch is being peeked, a week of data exists, and we're past the first-run teach copy.
-// Both the SwiftUI layout (frontPeekH) and the controller's hover/hit regions read this so the
-// taller peek stays clickable and hover-stable.
-func showsActivityStrip(_ s: IslandState) -> Bool {
-    s.notchPeek && !s.usageDays.isEmpty && !s.firstRunHint
-}
 
 /// One entry in the dropdown: either a project section header or a session row. Headers
 /// appear only when the roster spans more than one project; a single-project list is flat.
@@ -369,6 +370,10 @@ final class IslandState: ObservableObject {
     // Which strip cell the cursor is over (0…kActivityDays-1, -1 = none). Hit-tested in the
     // mouse monitor since SwiftUI's onHover never fires in this non-key panel.
     @Published var hoveredDay = -1
+    // The notch usage-peek shows ONE of two faces at a time, toggled by clicking the peek:
+    // false = the usage text line (session/today), true = the 7-day activity heatmap. Persists
+    // across hovers so it stays on whichever face the user last picked.
+    @Published var usageShowActivity = false
     // Real plan rate-limit % (from Claude Code's statusline `rate_limits`, captured by
     // island-statusline.py). "47" etc., or "" when unavailable (non-Max, or pre-first-response).
     // The 5h window is what Claude's plans call your "Session"; seven_day is the weekly cap.
@@ -2004,19 +2009,19 @@ struct IslandView: View {
     // "This Week" (7d) is still computed (`rlWeek`) but hidden here — may resurface later.
     @ViewBuilder
     private var usagePeekView: some View {
-        // The teach copy stands alone; every other peek stacks the activity strip under its
-        // text line (when we have a week of data to shade).
+        // The teach copy stands alone. Otherwise the peek shows ONE face at a time — the usage
+        // text line, or (when toggled and a week of data exists to shade) the activity heatmap —
+        // and a click swaps between them (handleIslandClick). Keeping them mutually exclusive
+        // instead of stacked keeps the peek from piling up two rows of stats.
         if state.firstRunHint {
             Text("👋 Hover the notch anytime to summon me").foregroundColor(.white)
+        } else if state.usageShowActivity && !state.usageDays.isEmpty {
+            ActivityStrip(levels: state.usageDays, tokens: state.usageDayTokens,
+                          hovered: state.hoveredDay)
+                .padding(.bottom, 3)
         } else {
-            VStack(spacing: 7) {
-                usagePeekLine
-                if !state.usageDays.isEmpty {
-                    ActivityStrip(levels: state.usageDays, tokens: state.usageDayTokens,
-                                  hovered: state.hoveredDay)
-                }
-            }
-            .padding(.bottom, 3)
+            usagePeekLine
+                .padding(.bottom, 3)
         }
     }
 
@@ -2158,7 +2163,7 @@ struct IslandView: View {
     // dropdown is open — the expanded sheet already names every session there.
     private var frontPeekH: CGFloat {
         guard state.frontHovered && !state.dropdownOpen else { return 0 }
-        return kFrontPeek + (showsActivityStrip(state) ? kUsagePeekExtra : 0)
+        return kFrontPeek
     }
 
     // Which states get the sweeping white shimmer on their left verb: the "in progress"
@@ -2823,7 +2828,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         // Idle never title-peeks either — there's no title/preview to show (peekText is forced
         // empty), so hovering the resting icon must not expand a strip with nothing in it; only
         // the notch itself still peeks (the usage stats), same as every other mode.
-        let front = !s.dropdownOpen && (overNotch || (!s.aggregate && s.mode != .idle && pointInFrontPill(p)))
+        // A single session's "Input Needed" cluster is a dropdown target too (`bucket`), so it
+        // must not peek on the way there — otherwise the strip flashes open for the one frame
+        // before the dropdown replaces it.
+        let front = !s.dropdownOpen
+            && (overNotch || (!s.aggregate && s.mode != .idle && bucket == nil && pointInFrontPill(p)))
         if s.frontHovered != front { setFrontHover(front) }
         // Run the marquee clock only while the session-message peek is up (not the static
         // notch peek) — it's a real run-loop timer, so don't leave it spinning idle.
@@ -2909,7 +2918,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         var bottom = f.maxY - islandH
         let top = f.maxY
         if s.roster.count >= 1 && s.mode != .idle { right += kAgentsPeek }  // "{n} ⌄" back pill peeks right
-        if s.frontHovered && !s.dropdownOpen { bottom -= kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0) }  // peek strip stays clickable
+        if s.frontHovered && !s.dropdownOpen { bottom -= kFrontPeek }  // peek strip stays clickable
         if s.dropdownOpen {
             right = left + curPillWidth + sheetSide     // sheet grows right…
             bottom = f.maxY - (islandH + dropdownContentHeight(s.dropdownItems) + kDropdownVPad + kDropdownBottomPad)  // …and down
@@ -3103,7 +3112,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let center = f.midX + curIslandOffset
         let left = center - curPillWidth / 2
         let right = center + curPillWidth / 2
-        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0) : 0)
+        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
         return p.x >= left && p.x <= right && p.y >= bottom && p.y <= f.maxY
     }
 
@@ -3127,7 +3136,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let notchGap: CGFloat = s.notchWidth + 80   // notchClearance, mirrors IslandView.pillWidth
         let left = center - curPillWidth / 2 + outerPadding + leadingSlot + notchGap
         let right = center + curPillWidth / 2
-        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0) : 0)
+        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
         return p.x >= left && p.x <= right && p.y >= bottom && p.y <= f.maxY
     }
 
@@ -3156,7 +3165,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let islandH = max(s.notchHeight, 30)
         let center = f.midX + curIslandOffset
         let top = f.maxY - islandH
-        let bottom = top - (kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0))
+        let bottom = top - kFrontPeek
         return abs(p.x - center) <= curPillWidth / 2 && p.y >= bottom && p.y <= top
     }
 
@@ -3219,14 +3228,18 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         return parts
     }
-    /// The status bucket under the cursor on the aggregate pill, or nil. Left cluster
-    /// (icon + headline) → headline bucket; each right count → its own bucket.
+    /// The status bucket under the cursor on the pill's status text, or nil. On the aggregate
+    /// pill: left cluster (icon + headline) → headline bucket; each right count → its own
+    /// bucket. On the SINGLE-session pill only an "input needed" left cluster is a target — it
+    /// opens the same input-needed dropdown the fleet headline does, so one waiting agent shows
+    /// its question exactly like five do; every other single mode keeps the left cluster as a
+    /// plain title-peek.
     private func hoveredAggBucket(_ p: NSPoint) -> String? {
         let s = IslandState.shared
-        guard s.aggregate else { return nil }
+        guard s.aggregate || s.mode == .attention else { return nil }
         let f = panel.frame
         let islandH = max(s.notchHeight, 30)
-        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek + (showsActivityStrip(s) ? kUsagePeekExtra : 0) : 0)
+        let bottom = f.maxY - islandH - (s.frontHovered ? kFrontPeek : 0)
         guard p.y >= bottom, p.y <= f.maxY else { return nil }
         let center = f.midX + curIslandOffset
         let left  = center - curPillWidth / 2
@@ -3234,12 +3247,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         let serif = NSFont(name: kSerifFontName, size: 13) ?? .systemFont(ofSize: 13)
         let sans  = NSFont(name: kSansFontName, size: 13) ?? .systemFont(ofSize: 13)
 
-        // Left cluster: [left+18, left+18+leftW]; leftW = leadingSlot + headline width.
-        let head = aggHeadlineBucket()
+        // Left cluster: [left+18, left+18+leftW]; leftW = leadingSlot + headline width. The
+        // single pill's verb is `detail` ("Input Needed"), drawn in the same 14pt "!" slot.
+        let head = s.aggregate ? aggHeadlineBucket() : "attention"
         let iconW: CGFloat = head == "attention" ? 14 : (head == "error" ? 16 : 18)
-        let primary = aggHeadlineText()
+        let primary = s.aggregate ? aggHeadlineText() : s.detail
         let leftW = iconW + (primary.isEmpty ? 0 : 8) + textWidth(primary, serif, tracking: 0.5)
         if p.x >= left + 18, p.x <= left + 18 + leftW { return head }
+        // Single pill: only that left cluster routes to the dropdown — its right side is the
+        // question preview, not a count, so it stays a peek target.
+        guard s.aggregate else { return nil }
 
         // Right cluster: text is trailing-aligned, ending 18 in from the pill's right edge.
         let parts = aggRightParts()
@@ -4165,12 +4182,17 @@ final class AppController: NSObject, NSApplicationDelegate {
             let info = cc[pid]
             let cwdFromSession = info?.cwd ?? ""
             let cwd = cwdFromSession.isEmpty ? envCwdIn(line) : cwdFromSession
-            guard let ident = tabIdentity(line, tty: tty, cwd: cwd) else { continue }
+            guard let ident = tabIdentity(line, tty: tty, cwd: cwd, sessionId: info?.sessionId ?? "") else { continue }
             let u = ident.key
             if cwds[u] == nil { cwds[u] = cwd }
             if focuses[u] == nil { focuses[u] = ident.focus }
             if sids[u] == nil, let sid = info?.sessionId, !sid.isEmpty { sids[u] = sid }
-            if line.contains("--fork-session") || line.contains("mcp__computer-use") {
+            // Forked sub-sessions and dedicated computer-use sessions are hidden. But the desktop
+            // app grants mcp__computer-use in --allowedTools to EVERY chat, so that string alone
+            // over-excludes real desktop sessions — skip the computer-use test for them (a genuine
+            // forked desktop sub-session still carries --fork-session and stays hidden).
+            let isDesktop = line.contains("CLAUDE_CODE_ENTRYPOINT=claude-desktop")
+            if line.contains("--fork-session") || (line.contains("mcp__computer-use") && !isDesktop) {
                 excluded.insert(u)   // forked / computer-use session — hide it
             }
         }
@@ -4584,7 +4606,12 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// descriptor. `tty` is the process's tty column (may be "??"; only used to focus idle tabs
     /// that have no state file). `cwd` comes from CC's session JSON when available, with env as
     /// a fallback. nil → a terminal we don't track per-tab (folds into "local").
-    private func tabIdentity(_ s: String, tty: String, cwd: String) -> (key: String, focus: String)? {
+    private func tabIdentity(_ s: String, tty: String, cwd: String, sessionId: String = "") -> (key: String, focus: String)? {
+        // ORDER IS LOAD-BEARING and mirrors island-hook.py's detect_terminal: every terminal is
+        // tried first, claude-desktop only as the last resort. Both sides must pick the SAME
+        // branch for the same process or the keys diverge and the card never gets its file — so
+        // when a process carries both a terminal env and the desktop entrypoint, both sides have
+        // to agree the terminal wins (it does more for us: a real per-tab focus target).
         if let r = s.range(of: "WARP_TERMINAL_SESSION_UUID=") {
             let u = s[r.upperBound...].prefix { $0.isHexDigit }
             return u.isEmpty ? nil : (String(u), "warp://session/\(u)")
@@ -4623,6 +4650,20 @@ final class AppController: NSObject, NSApplicationDelegate {
             // effects) — a real upgrade over app-activate when several editor windows are open.
             let focus = cwd.isEmpty ? "app:\(bundle)" : "editor:\(bundle):\(cwd)"
             return ("\(isCursor ? "cursor" : "vscode")-\(base)", focus)
+        }
+        // Claude Code hosted inside the desktop app — no tty or terminal env to key on, so key on
+        // the session (matching the hook) and focus by just bringing Claude frontmost; no per-chat
+        // deep link exists. Both signals mirror the hook's: CC sets CLAUDE_CODE_ENTRYPOINT itself,
+        // and __CFBundleIdentifier (set by the launching app) is the fallback. Nothing above
+        // matched, so there's no terminal identity to prefer over this.
+        if s.contains("CLAUDE_CODE_ENTRYPOINT=claude-desktop")
+            || s.contains("__CFBundleIdentifier=com.anthropic.claudefordesktop") {
+            // Require a real CC session id (from ~/.claude/sessions/<pid>.json) — the desktop app's
+            // `disclaimer` launch wrapper carries the same entrypoint env but has no session file,
+            // and keying it off cwd would synthesize a phantom titleless card. The hook always has
+            // session_id, so this matches its `cdesk-<hash(session_id)>` key.
+            guard !sessionId.isEmpty else { return nil }
+            return (claudeDesktopKey(sessionId), "app:com.anthropic.claudefordesktop")
         }
         return nil
     }
@@ -4737,6 +4778,13 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// Front-pill click: focus its Warp tab; if it's done, dismiss that card.
     func handleIslandClick() {
         let s = IslandState.shared
+        // Clicking the notch usage-peek swaps its two faces (usage text ⇄ 7-day heatmap) rather
+        // than focusing a tab — the cursor is over the notch, not a session pill. Only when there
+        // is a heatmap to swap to (a week of data, past the first-run teach copy).
+        if s.notchPeek && !s.usageDays.isEmpty && !s.firstRunHint {
+            s.usageShowActivity.toggle()
+            return
+        }
         // A little "still alive" wink on the resting mark: play one pass through the busy
         // glyphs, then settle back. Purely cosmetic, and idle has nothing actionable to jump
         // to, so this is also the ENTIRE click behavior while idle — never focuses/opens a

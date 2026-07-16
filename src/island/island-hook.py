@@ -385,7 +385,7 @@ def _controlling_tty():
     return ""
 
 
-def detect_terminal(cwd=""):
+def detect_terminal(cwd="", session_id=""):
     """Identify the terminal tab this session runs in. Returns (kind, tab_id, focus).
 
     tab_id keys the state file (one card per tab) and MUST match what the daemon derives from
@@ -433,6 +433,16 @@ def detect_terminal(cwd=""):
         kind = "cursor" if is_cursor else "vscode"
         focus = ("editor:" + bundle + ":" + cwd) if cwd else ("app:" + bundle)
         return kind, kind + "-" + tty.rsplit("/", 1)[-1], focus
+    # Claude Code hosted inside the Claude desktop app: no terminal env at all. CC sets
+    # CLAUDE_CODE_ENTRYPOINT=claude-desktop in its own process env, which hooks inherit reliably
+    # (unlike __CFBundleIdentifier — a CoreFoundation var macOS resets when it execs the
+    # non-bundled python3 hook, so it's only a fallback). Key the card by CC's session_id so
+    # each desktop conversation is its own card (no tty to key on); focus just brings Claude
+    # frontmost — no per-chat deep link exists.
+    if (os.environ.get("CLAUDE_CODE_ENTRYPOINT", "") == "claude-desktop"
+            or os.environ.get("__CFBundleIdentifier", "") == "com.anthropic.claudefordesktop"):
+        tab = "cdesk-" + short_hash(session_id or cwd)
+        return "claude-desktop", tab, "app:com.anthropic.claudefordesktop"
     return "local", "local", ""
 
 
@@ -445,7 +455,7 @@ def main():
     # Hooks run as children of Claude Code inside the terminal tab, so we inherit the terminal's
     # env. From it we derive a stable per-tab id (keys this session's file — one card per tab)
     # and a focus descriptor the daemon dispatches on to jump back to the tab. See detect_terminal.
-    kind, tab, focus = detect_terminal(cwd)
+    kind, tab, focus = detect_terminal(cwd, d.get("session_id", "") or "")
     session_out = "sessions/%s.json" % tab
     ts = float(int(time.time()))
     transcript = d.get("transcript_path", "") or ""

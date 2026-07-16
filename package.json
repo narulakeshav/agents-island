@@ -1,17 +1,24 @@
 {
   "name": "claude-code-island",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A live-activity island in your Mac's notch for Claude Code — see what every session is doing across all your terminals, and click to jump back to the right tab.",
   "bin": {
     "claude-code-island": "bin/cli.js"
   },
   "files": [
     "bin/",
-    "src/island/"
+    "src/island/island.swift",
+    "src/island/island-send.swift",
+    "src/island/island-hook.py",
+    "src/island/island-statusline.py",
+    "src/island/assets/"
   ],
   "os": [
     "darwin"
   ],
+  "engines": {
+    "node": ">=16.7.0"
+  },
   "keywords": [
     "claude",
     "claude-code",

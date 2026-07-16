@@ -23,8 +23,25 @@ const EVENT_DIR = path.join(HOME, ".claude-island");
 const VERSION = require("../package.json").version;
 const LOCAL_CODESIGN_NAME = "Claude Island Local";
 
-// Matches hooks owned by this tool or the legacy banner notifier we migrate from.
-const MINE = /claude-island|island-hook|ClaudeNotify|ClaudeCodeNotification|stop-hook/;
+// Matches hooks owned by this tool or the legacy banner notifier we migrate from. Every
+// alternative here must be a name WE own: anything matching gets stripped from the user's
+// settings on install and deleted on uninstall. (A bare `stop-hook` used to be listed — it
+// would eat an unrelated `~/bin/stop-hook.sh` a user wired up themselves, and matched nothing
+// of ours that `ClaudeNotify` didn't already: the legacy command was always
+// `~/Applications/ClaudeNotify.app/Contents/MacOS/stop-hook.sh`.)
+const MINE = /claude-island|island-hook|ClaudeNotify|ClaudeCodeNotification/;
+
+// The hook events we own → the event name each passes to island-hook.py. Install writes
+// exactly these; uninstall removes exactly these. One list, so the two can never drift.
+const HOOK_EVENTS = {
+  UserPromptSubmit: "prompt",
+  PreToolUse: "tool",
+  PostToolUse: "post",
+  Notification: "attention",
+  Stop: "stop",
+  PreCompact: "compact",         // → "Compacting…"
+  SessionStart: "sessionstart",  // source=compact → "Compacted"
+};
 
 // ── Colors ──────────────────────────────────────────────────────────────
 
@@ -318,9 +335,18 @@ async function install() {
   } else {
     autoConfig = await ask(`Auto-configure Claude Code hooks? ${c.dim}(Y/n)${c.reset} `);
   }
+  // The app is already built, swapped in, and running by this point, so a settings.json we
+  // can't parse is not a reason to die — it's a reason to leave the file alone and say so.
+  let hooksWired = true;
   if (autoConfig.toLowerCase() !== "n") {
-    configureHooks(hookDest, statuslineDest);
-    done("Updated ~/.claude/settings.json");
+    if (configureHooks(hookDest, statuslineDest)) {
+      done("Updated ~/.claude/settings.json");
+    } else {
+      hooksWired = false;
+      warn("Couldn't parse ~/.claude/settings.json — left it untouched");
+      info("Fix the JSON there and re-run install, or add these yourself:");
+      printManualHooks(hookDest);
+    }
   } else {
     log();
     info("Add these hooks to ~/.claude/settings.json (see README).");
@@ -330,6 +356,13 @@ async function install() {
   log();
   hr();
   log();
+  if (!hooksWired) {
+    console.log(`  ${c.orange}◆${c.reset} ${c.bold}${c.white}Island is live — but it can't see Claude yet.${c.reset}`);
+    log();
+    info("Nothing reaches the notch until those hooks are in place.");
+    log();
+    return;
+  }
   console.log(`  ${c.orange}◆${c.reset} ${c.bold}${c.white}You're all set!${c.reset}`);
   log();
   info(`Test it: ${c.white}npx claude-code-island test${c.reset}`);
@@ -341,13 +374,41 @@ async function install() {
 
 // ── Hook config ───────────────────────────────────────────────────────────
 
-function configureHooks(hookDest, statuslineDest) {
-  let settings = {};
-  if (fs.existsSync(SETTINGS_PATH)) {
-    settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
-  } else {
-    fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
+// Read Claude's settings. `{}` when there's no file yet; null when there IS one and it doesn't
+// parse — callers must treat null as "hands off" rather than falling back to `{}`, or we'd
+// replace a settings file we couldn't read with one containing nothing but our own hooks.
+function readSettings() {
+  if (!fs.existsSync(SETTINGS_PATH)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
+  } catch {
+    return null;
   }
+}
+
+// Write settings back, keeping a timestamped copy of what was there first. This file is the
+// user's, and the one thing in this install we can't recreate for them if we get it wrong.
+function writeSettings(settings) {
+  fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
+  if (fs.existsSync(SETTINGS_PATH)) {
+    fs.copyFileSync(SETTINGS_PATH, `${SETTINGS_PATH}.island-backup-${Date.now()}`);
+  }
+  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
+}
+
+// Print what we would have written, for when we can't touch settings.json ourselves.
+function printManualHooks(hookDest) {
+  log();
+  for (const [event, arg] of Object.entries(HOOK_EVENTS)) {
+    log(`  ${c.dim}"${event}": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "\\"${hookDest}\\" ${arg}" }] }]${c.reset}`);
+  }
+  log();
+}
+
+// Returns false if settings.json exists but couldn't be parsed (nothing was written).
+function configureHooks(hookDest, statuslineDest) {
+  const settings = readSettings();
+  if (settings === null) return false;
   if (!settings.hooks) settings.hooks = {};
 
   // Statusline feed: the ONLY supported source for the live plan rate-limit % (5h / 7d), captured
@@ -373,16 +434,12 @@ function configureHooks(hookDest, statuslineDest) {
       (n) => !n.hooks?.some((h) => MINE.test(h.command || ""))
     );
 
-  settings.hooks.UserPromptSubmit = [...strip(settings.hooks.UserPromptSubmit), hook("prompt")];
-  settings.hooks.PreToolUse = [...strip(settings.hooks.PreToolUse), hook("tool")];
-  settings.hooks.PostToolUse = [...strip(settings.hooks.PostToolUse), hook("post")];
-  settings.hooks.Notification = [...strip(settings.hooks.Notification), hook("attention")];
-  settings.hooks.Stop = [...strip(settings.hooks.Stop), hook("stop")];
-  // PreCompact → "Compacting…"; SessionStart (source=compact) → "Compacted".
-  settings.hooks.PreCompact = [...strip(settings.hooks.PreCompact), hook("compact")];
-  settings.hooks.SessionStart = [...strip(settings.hooks.SessionStart), hook("sessionstart")];
+  for (const [event, arg] of Object.entries(HOOK_EVENTS)) {
+    settings.hooks[event] = [...strip(settings.hooks[event]), hook(arg)];
+  }
 
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
+  writeSettings(settings);
+  return true;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -420,17 +477,21 @@ function uninstall() {
     done("Removed ~/.claude-island");
   }
 
-  if (fs.existsSync(SETTINGS_PATH)) {
-    const settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
+  // Everything above is ours to delete outright. settings.json isn't — so if it won't parse,
+  // say so and leave it rather than guessing at its contents.
+  const settings = readSettings();
+  if (settings === null) {
+    warn("Couldn't parse ~/.claude/settings.json — remove the island hooks there by hand");
+  } else {
     let removed = false;
-    for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "PreCompact", "SessionStart"]) {
-      if (settings.hooks?.[event]) {
-        settings.hooks[event] = settings.hooks[event].filter(
-          (n) => !n.hooks?.some((h) => MINE.test(h.command || ""))
-        );
-        if (settings.hooks[event].length === 0) delete settings.hooks[event];
-        removed = true;
-      }
+    for (const event of Object.keys(HOOK_EVENTS)) {
+      const cur = settings.hooks?.[event];
+      if (!cur) continue;
+      const kept = cur.filter((n) => !n.hooks?.some((h) => MINE.test(h.command || "")));
+      if (kept.length === cur.length) continue;   // nothing of ours here — don't touch it
+      if (kept.length) settings.hooks[event] = kept;
+      else delete settings.hooks[event];
+      removed = true;
     }
     if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
     const curStatusLine = settings.statusLine?.command || "";
@@ -439,7 +500,7 @@ function uninstall() {
       removed = true;
     }
     if (removed) {
-      fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
+      writeSettings(settings);
       done("Removed hooks/statusline from ~/.claude/settings.json");
     }
   }

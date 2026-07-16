@@ -11,7 +11,7 @@ syncing model, and — most important — the **non-obvious quirks** that cost h
 ## 1. The three processes
 
 ```
-Claude Code hooks ──> island-hook.sh ──> island-send ──> ~/.claude-island/sessions/<tab>.json
+Claude Code hooks ──> island-hook.py ──> island-send ──> ~/.claude-island/sessions/<tab>.json
                                                               │  (+ Darwin notification)
                                                               ▼
                                                        island (daemon)  ──> NSPanel at the notch
@@ -21,8 +21,10 @@ Claude Code hooks ──> island-hook.sh ──> island-send ──> ~/.claude-i
   (LaunchAgent `com.claude-island.app`, KeepAlive). Owns a borderless,
   non-activating `NSPanel` pinned top-center of the notch screen, rendering a
   SwiftUI `IslandView`. Woken by a Darwin notification; also polls on a 4s timer.
-- **`island-hook.sh`** — invoked by CC hooks. Reads the hook JSON on stdin,
+- **`island-hook.py`** — invoked by CC hooks. Reads the hook JSON on stdin,
   derives the session's state, writes it to that session's file via `island-send`.
+  (Replaced an earlier `island-hook.sh`, which spawned ~8-10 `python3 -c` processes
+  per event; the rewrite is one process. The bash version is gone as of v0.2.0.)
 - **`island-send.swift`** — tiny helper: reads JSON on stdin, atomically writes it
   to the path given as `argv[1]` (relative to `~/.claude-island`, default
   `event.json`), then posts the Darwin notification `com.claude-island.event`.
@@ -41,8 +43,8 @@ Claude Code hooks ──> island-hook.sh ──> island-send ──> ~/.claude-i
 - `event.json` — legacy single-session file; still the `island-send` default but
   the daemon no longer reads it.
 - `context-window` — optional integer override for the context-ring denominator.
-- `claude.gif`, `claude-thinking.gif` — spinner art (placed manually for now; the
-  installer does **not** copy them yet — a known TODO).
+- `claude.gif`, `claude-thinking.gif` — spinner art, copied here from
+  `src/island/assets/` by the installer (`cli.js`).
 
 ---
 
@@ -242,7 +244,7 @@ APP="$HOME/Applications/ClaudeIsland.app/Contents/MacOS"
 SRC=".../src/island"
 swiftc -O -o "$APP/island"      "$SRC/island.swift"      -framework Cocoa -framework SwiftUI
 swiftc -O -o "$APP/island-send" "$SRC/island-send.swift" -framework Foundation
-cp "$SRC/island-hook.sh" "$APP/island-hook.sh"; chmod +x "$APP/island-hook.sh"
+cp "$SRC/island-hook.py" "$APP/island-hook.py"; chmod +x "$APP/island-hook.py"
 codesign --force --deep --sign - "$HOME/Applications/ClaudeIsland.app"
 launchctl kickstart -k "gui/$(id -u)/com.claude-island.app"   # restart daemon
 ```
@@ -263,12 +265,13 @@ session's file mid-test. And screenshots can't confirm physical-notch clipping.
 
 ## 7. Known TODOs / deferred
 
-- Installer (`cli.js`) does not yet copy the GIF assets into `~/.claude-island/`.
-- `PostToolUse` wiring was hand-patched into `settings.json` during dev; confirm
-  `cli.js` writes it on a fresh install.
-- npm package is still named `claude-notification`; README/screenshots describe the
-  old banner version.
 - **Presence- vs event-driven** display (show idle open tabs vs only-after-activity)
   is an open product decision.
+- Claude-desktop sessions (`cdesk-*`) focus the app, not the chat — no per-chat deep
+  link exists.
+- The README promises macOS 13+. Nothing enforces it: `cli.js` builds against the
+  host SDK with no `-target`, so an API added after 13 would compile fine here and
+  only fail at a 13 user's install. To check the floor by hand:
+  `swiftc -O -target $(uname -m)-apple-macos13.0 -o /tmp/x src/island/island.swift -framework Cocoa -framework SwiftUI`
 - Front-focus after a daemon restart falls back to most-recent activity until you
   prompt a tab (promptTs isn't persisted).

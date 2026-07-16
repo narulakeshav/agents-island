@@ -1,2 +1,6 @@
 node_modules/
 .DS_Store
+
+# Working notes — kept locally, not published.
+vision.md
+improvements.md

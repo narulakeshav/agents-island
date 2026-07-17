@@ -3787,15 +3787,26 @@ final class AppController: NSObject, NSApplicationDelegate {
     // Visible = sessions that have actually run (have a file) and whose tab is still
     // live. Open-but-never-run tabs have no session here, so they never appear.
     private func visibleSessions(suppressing suppress: Set<String>) -> [String: LiveSession] {
-        // liveTabs comes from a pgrep for `claude`, so it can only ever vouch for Claude Code.
-        // Codex Desktop runs every chat inside one shared `codex app-server` process, so there's
-        // no per-session process to find — codex-watch.py decides liveness from rollout mtime
-        // instead and owns these files' whole lifecycle (it deletes them when a chat goes cold,
-        // and the daemon prunes any session whose file vanished). So trust the file's existence.
-        sessions.filter { (k, _) in
-            let codexShown = showCodex && k.hasPrefix("cdex-")   // gated by the menu-bar toggle
-            return (liveTabs.contains(k) || k == "local" || codexShown) && !suppress.contains(k)
+        // App-hosted sessions (Claude Desktop cdesk-, Codex cdex-) show ONLY while active. Opening
+        // either app resurfaces old finished chats — Claude Desktop keeps their process alive, and
+        // Codex re-touches their session logs — so a done/idle one there is just clutter with no tab
+        // to return to. A terminal tab is different: you're about to type back into it, so those keep
+        // showing idle/stale (the else branch, unchanged). liveTabs is a pgrep for `claude`, so it
+        // only vouches for terminal Claude + cdesk-; Codex has no process (one shared app-server),
+        // so codex-watch.py owns cdex- liveness by rollout mtime and prunes cold files itself.
+        sessions.filter { (k, v) in
+            if suppress.contains(k) { return false }
+            if k.hasPrefix("cdesk-") { return liveTabs.contains(k) && appSessionActive(v.mode) }
+            if k.hasPrefix("cdex-")  { return showCodex && appSessionActive(v.mode) }
+            return liveTabs.contains(k) || k == "local"
         }
+    }
+
+    /// Mid-turn or waiting on you — the only states worth surfacing for an app-hosted session
+    /// (one with no terminal tab to jump back to). Everything else (done/idle/compacted/error/
+    /// interrupted/declined/stale) is hidden for those, but still shown for terminal tabs.
+    private func appSessionActive(_ mode: String) -> Bool {
+        ["thinking", "working", "compacting", "struggling", "attention"].contains(mode)
     }
 
     /// Tab UUIDs to hide as duplicates: the same Claude conversation (identical transcript)

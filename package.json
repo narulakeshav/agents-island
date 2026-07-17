@@ -5,6 +5,9 @@
   "bin": {
     "claude-code-island": "bin/cli.js"
   },
+  "scripts": {
+    "test": "node test/settings.test.js"
+  },
   "files": [
     "bin/",
     "src/island/island.swift",

@@ -67,8 +67,14 @@ Detection and app-icon tagging work everywhere; click-to-focus fidelity depends 
 ```bash
 npx claude-code-island install     # compile, install, wire up the Claude Code hook
 npx claude-code-island test        # cycle through the states so you can see it
+npx claude-code-island doctor      # check your install if something looks off
 npx claude-code-island uninstall   # remove the app, hook, and config
 ```
+
+> **First click:** the notch works with no special permissions. The first time you
+> *click* a session to jump to its tab, macOS asks to let Claude Island control that
+> terminal — click **OK**. Denied it by accident? Re-enable under System Settings →
+> Privacy & Security → Automation.
 
 ## How it works
 
@@ -78,8 +84,12 @@ Because the daemon just renders those session files, the Claude-specific part is
 
 ## Requirements
 
-- **macOS 13+** with a notch (MacBook Pro/Air 2021+).
-- **Xcode Command Line Tools** — `xcode-select --install`. The installer compiles a ~200KB native app locally (ad-hoc signed, no Apple Developer account needed).
+- **macOS 13+.** Built for the notch (MacBook Pro/Air 2021+); on a notch-less Mac it
+  still runs, anchored to the menu-bar strip instead.
+- **Xcode Command Line Tools** — `xcode-select --install`. The installer compiles a ~200KB
+  native app locally (ad-hoc signed, no Apple Developer account needed). Because it builds
+  on your machine rather than downloading a binary, there's no Gatekeeper "unidentified
+  developer" prompt. `python3`, which the hook runs on, comes with the Command Line Tools.
 - **Claude Code** installed and configured.
 
 ## Uninstall

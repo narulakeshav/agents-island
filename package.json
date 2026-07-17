@@ -1,6 +1,6 @@
 {
   "name": "agents-island",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A live-activity island in your Mac's notch for your coding agents — see what every session is doing across all your terminals, and click to jump back to the right tab.",
   "bin": {
     "agents-island": "bin/cli.js"

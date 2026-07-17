@@ -3,7 +3,7 @@
 A live-activity **island in your Mac's notch** for your coding agents. See what every session is doing — across all your terminals and apps — and jump back to the exact one with a click. Wired for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex) out of the box; the surface itself is agent-agnostic.
 
 ```bash
-npx agents-island install
+npx agents-island
 ```
 
 > macOS 13+ (best with a notch) · Xcode Command Line Tools (`xcode-select --install`) · Claude Code and/or Codex.

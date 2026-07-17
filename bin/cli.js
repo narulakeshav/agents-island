@@ -689,26 +689,33 @@ function doctor() {
 
 // ── CLI ─────────────────────────────────────────────────────────────────
 
+function showUsage() {
+  console.log(LOGO);
+  hr();
+  log();
+  log(`${c.white}Usage:${c.reset}`);
+  log();
+  log(`  ${c.orange}(no args)${c.reset}   Set up the notch island (same as install)`);
+  log(`  ${c.orange}install --no-hooks${c.reset}  Rebuild/relaunch without touching Claude settings`);
+  log(`  ${c.orange}test${c.reset}        Run through the states`);
+  log(`  ${c.orange}doctor${c.reset}      Diagnose a broken install`);
+  log(`  ${c.orange}uninstall${c.reset}   Remove everything`);
+  log();
+  info(`npx agents-island`);
+  log();
+}
+
 function runCLI() {
   switch (process.argv[2]) {
+    // Bare `npx agents-island` is the whole pitch — default it to install. Only an explicit
+    // help flag or an unknown command falls through to usage, so a typo never triggers a build.
+    case undefined:
     case "install":   install(); break;
     case "uninstall": uninstall(); break;
     case "test":      test(); break;
     case "doctor":    doctor(); break;
-    default:
-      console.log(LOGO);
-      hr();
-      log();
-      log(`${c.white}Usage:${c.reset}`);
-      log();
-      log(`  ${c.orange}install${c.reset}     Set up the notch island`);
-      log(`  ${c.orange}install --no-hooks${c.reset}  Rebuild/relaunch without touching Claude settings`);
-      log(`  ${c.orange}test${c.reset}        Run through the states`);
-      log(`  ${c.orange}doctor${c.reset}      Diagnose a broken install`);
-      log(`  ${c.orange}uninstall${c.reset}   Remove everything`);
-      log();
-      info(`npx agents-island install`);
-      log();
+    case "help": case "--help": case "-h": showUsage(); break;
+    default:          showUsage(); break;
   }
 }
 

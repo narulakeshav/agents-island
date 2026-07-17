@@ -14,6 +14,7 @@
     "src/island/island-send.swift",
     "src/island/island-hook.py",
     "src/island/island-statusline.py",
+    "src/island/codex-watch.py",
     "src/island/assets/"
   ],
   "os": [

@@ -2696,9 +2696,31 @@ final class AppController: NSObject, NSApplicationDelegate {
         rebuild()   // visibleSessions re-filters cdex-* in/out on the next roster build
     }
 
+    // The Codex-session watcher (codex-watch.py) tails ~/.codex rollouts into cdex-* cards. It has
+    // no hook to run it (Codex offers none), so the daemon owns its lifecycle: spawn one on launch,
+    // kill it on quit. Only when Codex is actually installed — Claude-only users never pay for it.
+    private var codexWatcher: Process?
+    private func startCodexWatcher() {
+        guard FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.codex") else { return }
+        // Reap any watcher a prior daemon instance left behind (crash/relaunch) before spawning one,
+        // so there's never more than a single tailer writing the same cards.
+        _ = shell("/usr/bin/pkill", ["-f", "codex-watch.py --watch"])
+        let script = (Bundle.main.bundlePath as NSString).appendingPathComponent("Contents/MacOS/codex-watch.py")
+        guard FileManager.default.fileExists(atPath: script) else { return }
+        let p = Process()
+        p.launchPath = "/usr/bin/env"
+        p.arguments = ["python3", script, "--watch"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        codexWatcher = p
+    }
+
     @objc private func quitIsland() {
         // KeepAlive=true would relaunch a plain terminate, so bootout the LaunchAgent — it stays
         // quit until next login (or a reinstall / manual `launchctl bootstrap`).
+        codexWatcher?.terminate()
+        _ = shell("/usr/bin/pkill", ["-f", "codex-watch.py --watch"])
         _ = shell("/bin/launchctl", ["bootout", "gui/\(getuid())/com.agents-island.app"])
         NSApp.terminate(nil)
     }
@@ -2728,6 +2750,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel.contentView = hosting
         position()
         setupStatusItem()
+        startCodexWatcher()
 
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         CFNotificationCenterAddObserver(center,

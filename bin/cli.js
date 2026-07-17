@@ -14,6 +14,7 @@ const ISLAND_SRC = path.join(__dirname, "..", "src", "island", "island.swift");
 const SEND_SRC = path.join(__dirname, "..", "src", "island", "island-send.swift");
 const HOOK_SRC = path.join(__dirname, "..", "src", "island", "island-hook.py");
 const STATUSLINE_SRC = path.join(__dirname, "..", "src", "island", "island-statusline.py");
+const CODEX_WATCH_SRC = path.join(__dirname, "..", "src", "island", "codex-watch.py");
 const ASSETS_DIR = path.join(__dirname, "..", "src", "island", "assets");
 const SETTINGS_PATH = path.join(HOME, ".claude", "settings.json");
 const LAUNCH_AGENTS = path.join(HOME, "Library", "LaunchAgents");
@@ -199,6 +200,9 @@ function stopAgent() {
   const uid = process.getuid();
   try { execFileSync("/bin/launchctl", ["bootout", `gui/${uid}/${PLIST_LABEL}`], { stdio: "pipe" }); } catch {}
   try { execFileSync("/bin/launchctl", ["unload", "-w", PLIST_PATH], { stdio: "pipe" }); } catch {}
+  // The daemon spawns the Codex watcher as a child; booting the daemon out orphans it to launchd,
+  // so kill it here too. The next daemon launch respawns a fresh one.
+  try { execFileSync("/usr/bin/pkill", ["-f", "codex-watch.py --watch"], { stdio: "pipe" }); } catch {}
 }
 
 function startAgent() {
@@ -234,6 +238,12 @@ function buildStagedApp() {
   const statuslineDest = path.join(stagedMacOS, "island-statusline.py");
   fs.copyFileSync(STATUSLINE_SRC, statuslineDest);
   fs.chmodSync(statuslineDest, 0o755);
+
+  // The Codex-session watcher. The daemon spawns it at launch when ~/.codex exists (see
+  // startCodexWatcher); it just needs to ride along in the bundle beside island-send.
+  const codexDest = path.join(stagedMacOS, "codex-watch.py");
+  fs.copyFileSync(CODEX_WATCH_SRC, codexDest);
+  fs.chmodSync(codexDest, 0o755);
 
   const signedWith = signApp(stagedApp);
   return { stageRoot, stagedApp, signedWith };
@@ -659,6 +669,14 @@ function doctor() {
     line(/island-statusline/.test(settings.statusLine?.command || ""),
       "Statusline wired (usage %)",
       "optional — only powers the notch usage peek");
+  }
+
+  // Codex is optional: only report on it when the user actually has Codex installed.
+  if (fs.existsSync(path.join(HOME, ".codex"))) {
+    let watching = false;
+    try { watching = execFileSync("/usr/bin/pgrep", ["-f", "codex-watch.py --watch"], { encoding: "utf8", stdio: "pipe" }).trim().length > 0; } catch {}
+    line(watching, "Codex watcher running",
+      "restart the island (npx agents-island install) — the daemon spawns it, or toggle Show Codex on");
   }
 
   log();

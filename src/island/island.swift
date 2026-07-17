@@ -104,6 +104,8 @@ func terminalBundleId(focus: String, id: String) -> String? {
     if id.hasPrefix("cursor-") { return "com.todesktop.230313mzl4w4u92" }
     if id.hasPrefix("vscode-") { return "com.microsoft.VSCode" }
     if id.hasPrefix("cdesk-") { return "com.anthropic.claudefordesktop" }
+    // Codex Desktop ships inside ChatGPT.app, whose bundle id really is com.openai.codex.
+    if id.hasPrefix("cdex-") { return "com.openai.codex" }
     // A bare hex id with no scheme is a Warp tab (uuid-keyed).
     if !id.isEmpty, id != "local", id.allSatisfy({ $0.isHexDigit }) { return "dev.warp.Warp-Stable" }
     return nil
@@ -121,16 +123,42 @@ private var _appIconCache: [String: NSImage] = [:]
 /// The app icon for a bundle id, cached (rendered per-row, so memoize). Prefers a running
 /// instance's icon, else resolves on disk; Warp ships two channels (Stable/Preview) so fall
 /// back to any running "warp" app.
+/// Codex Desktop's real icon — the one in the Dock — which macOS will not give us.
+///
+/// Codex ships inside ChatGPT.app, an Electron bundle still named "ChatGPT" whose static
+/// CFBundleIconFile is `electron.icns` (the ChatGPT knot). The Codex mark is applied to the Dock
+/// at RUNTIME, so `NSRunningApplication.icon` and `icon(forFile:)` both hand back the knot no
+/// matter what you see in the Dock. The actual art ships beside it as loose PNGs, so load one.
+///
+/// Light variant deliberately: it's what the Dock shows in Light appearance, and the island is a
+/// permanently dark surface — the dark-mode tile is near-black and would sink into the row.
+/// Resolved via the bundle id rather than a hardcoded /Applications path so a relocated app (or
+/// a rename away from "ChatGPT.app") still works.
+private func codexAppIcon() -> NSImage? {
+    guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex")
+    else { return nil }
+    for name in ["icon-codex-light", "icon-codex-dark-color"] {
+        let p = url.appendingPathComponent("Contents/Resources/\(name).png").path
+        if let img = NSImage(contentsOfFile: p) { return img }
+    }
+    return nil   // art moved/renamed — caller falls back to the bundle icon
+}
+
 func appIcon(bundleId: String) -> NSImage? {
     if let c = _appIconCache[bundleId] { return c }
     let running = NSWorkspace.shared.runningApplications
     var img: NSImage?
-    if let a = running.first(where: { $0.bundleIdentifier == bundleId }) { img = a.icon }
-    else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
-        img = NSWorkspace.shared.icon(forFile: url.path)
-    } else if bundleId.lowercased().contains("warp"),
-              let a = running.first(where: { ($0.bundleIdentifier ?? "").lowercased().contains("warp") }) {
-        img = a.icon
+    // Codex first — asking macOS would only ever return ChatGPT.app's static knot (see
+    // codexAppIcon). Everything below is the fallback for when that art can't be found.
+    if bundleId == "com.openai.codex" { img = codexAppIcon() }
+    if img == nil {
+        if let a = running.first(where: { $0.bundleIdentifier == bundleId }) { img = a.icon }
+        else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
+            img = NSWorkspace.shared.icon(forFile: url.path)
+        } else if bundleId.lowercased().contains("warp"),
+                  let a = running.first(where: { ($0.bundleIdentifier ?? "").lowercased().contains("warp") }) {
+            img = a.icon
+        }
     }
     if let img { _appIconCache[bundleId] = img }
     return img
@@ -3713,7 +3741,14 @@ final class AppController: NSObject, NSApplicationDelegate {
     // Visible = sessions that have actually run (have a file) and whose tab is still
     // live. Open-but-never-run tabs have no session here, so they never appear.
     private func visibleSessions(suppressing suppress: Set<String>) -> [String: LiveSession] {
-        sessions.filter { (k, _) in (liveTabs.contains(k) || k == "local") && !suppress.contains(k) }
+        // liveTabs comes from a pgrep for `claude`, so it can only ever vouch for Claude Code.
+        // Codex Desktop runs every chat inside one shared `codex app-server` process, so there's
+        // no per-session process to find — codex-watch.py decides liveness from rollout mtime
+        // instead and owns these files' whole lifecycle (it deletes them when a chat goes cold,
+        // and the daemon prunes any session whose file vanished). So trust the file's existence.
+        sessions.filter { (k, _) in
+            (liveTabs.contains(k) || k == "local" || k.hasPrefix("cdex-")) && !suppress.contains(k)
+        }
     }
 
     /// Tab UUIDs to hide as duplicates: the same Claude conversation (identical transcript)

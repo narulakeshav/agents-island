@@ -128,6 +128,8 @@ function appPlist() {
     <string>APPL</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Claude Island focuses the terminal tab a session is running in when you click it.</string>
 </dict>
 </plist>`;
 }
@@ -386,14 +388,34 @@ function readSettings() {
   }
 }
 
+const BACKUP_PREFIX = "settings.json.island-backup-";
+const KEEP_BACKUPS = 3;   // enough to recover a bad edit; not enough to litter ~/.claude/
+
 // Write settings back, keeping a timestamped copy of what was there first. This file is the
-// user's, and the one thing in this install we can't recreate for them if we get it wrong.
+// user's, and the one thing in this install we can't recreate for them if we get it wrong. We
+// then prune to the newest KEEP_BACKUPS so repeated installs don't pile up copies forever.
 function writeSettings(settings) {
-  fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
+  const dir = path.dirname(SETTINGS_PATH);
+  fs.mkdirSync(dir, { recursive: true });
   if (fs.existsSync(SETTINGS_PATH)) {
-    fs.copyFileSync(SETTINGS_PATH, `${SETTINGS_PATH}.island-backup-${Date.now()}`);
+    fs.copyFileSync(SETTINGS_PATH, path.join(dir, `${BACKUP_PREFIX}${Date.now()}`));
+    pruneBackups(dir);
   }
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
+}
+
+// Keep only the newest KEEP_BACKUPS island backups; delete the rest. Best-effort — a backup we
+// can't remove is harmless, so never let cleanup failure break an install.
+function pruneBackups(dir) {
+  try {
+    const old = fs.readdirSync(dir)
+      .filter((f) => f.startsWith(BACKUP_PREFIX))
+      .sort()                       // timestamp-suffixed → lexicographic == chronological
+      .slice(0, -KEEP_BACKUPS);
+    for (const f of old) {
+      try { fs.unlinkSync(path.join(dir, f)); } catch {}
+    }
+  } catch {}
 }
 
 // Print what we would have written, for when we can't touch settings.json ourselves.
@@ -457,6 +479,29 @@ function ask(question) {
 
 // ── Uninstall ───────────────────────────────────────────────────────────
 
+// Strip every island-owned hook and our statusline out of a settings object, IN PLACE. Only
+// removes entries whose command matches MINE, and only deletes an event array once it's empty —
+// a user's own hooks under the same event are left untouched. Returns true if anything changed.
+// Pure (no I/O), so the destructive path is unit-testable without launchctl/fs side effects.
+function stripIslandFromSettings(settings) {
+  let removed = false;
+  for (const event of Object.keys(HOOK_EVENTS)) {
+    const cur = settings.hooks?.[event];
+    if (!cur) continue;
+    const kept = cur.filter((n) => !n.hooks?.some((h) => MINE.test(h.command || "")));
+    if (kept.length === cur.length) continue;   // nothing of ours here — don't touch it
+    if (kept.length) settings.hooks[event] = kept;
+    else delete settings.hooks[event];
+    removed = true;
+  }
+  if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  if (/island-statusline|ClaudeIsland/.test(settings.statusLine?.command || "")) {
+    delete settings.statusLine;
+    removed = true;
+  }
+  return removed;
+}
+
 function uninstall() {
   console.log(LOGO);
   hr();
@@ -482,27 +527,9 @@ function uninstall() {
   const settings = readSettings();
   if (settings === null) {
     warn("Couldn't parse ~/.claude/settings.json — remove the island hooks there by hand");
-  } else {
-    let removed = false;
-    for (const event of Object.keys(HOOK_EVENTS)) {
-      const cur = settings.hooks?.[event];
-      if (!cur) continue;
-      const kept = cur.filter((n) => !n.hooks?.some((h) => MINE.test(h.command || "")));
-      if (kept.length === cur.length) continue;   // nothing of ours here — don't touch it
-      if (kept.length) settings.hooks[event] = kept;
-      else delete settings.hooks[event];
-      removed = true;
-    }
-    if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
-    const curStatusLine = settings.statusLine?.command || "";
-    if (/island-statusline|ClaudeIsland/.test(curStatusLine)) {
-      delete settings.statusLine;
-      removed = true;
-    }
-    if (removed) {
-      writeSettings(settings);
-      done("Removed hooks/statusline from ~/.claude/settings.json");
-    }
+  } else if (stripIslandFromSettings(settings)) {
+    writeSettings(settings);
+    done("Removed hooks/statusline from ~/.claude/settings.json");
   }
 
   log();
@@ -554,31 +581,97 @@ async function test() {
   log();
 }
 
+// ── Doctor ──────────────────────────────────────────────────────────────
+
+// A pasteable health report. When the island "doesn't work" for someone, this turns a vague
+// report into a concrete one: what's missing (a toolchain, the daemon, the hooks) and the exact
+// next step. Read-only — it never changes anything.
+function doctor() {
+  console.log(LOGO);
+  hr();
+  log();
+
+  const has = (bin) => {
+    try { execFileSync("/usr/bin/which", [bin], { stdio: "pipe" }); return true; } catch { return false; }
+  };
+  const running = () => {
+    try {
+      const out = execFileSync("/usr/bin/pgrep", ["-f", `${APP_PATH}/Contents/MacOS/island`], { encoding: "utf8", stdio: "pipe" });
+      return out.trim().length > 0;
+    } catch { return false; }
+  };
+  const line = (ok, label, hint) => {
+    (ok ? done : warn)(label);
+    if (!ok && hint) info(`  → ${hint}`);
+  };
+
+  // Toolchain the installer/hook depend on.
+  line(has("swiftc"), "Swift compiler (swiftc)", "xcode-select --install");
+  line(has("python3"), "python3 (runs the hook)", "comes with Xcode Command Line Tools");
+
+  // The app + background agent.
+  line(fs.existsSync(path.join(MACOS_DIR, "island")), "App compiled", "npx claude-code-island install");
+  line(fs.existsSync(PLIST_PATH), "LaunchAgent installed", "npx claude-code-island install");
+  line(running(), "Daemon running", "npx claude-code-island install, or check Console.app for com.claude-island");
+  line(fs.existsSync(EVENT_DIR), "State dir ~/.claude-island", "npx claude-code-island install");
+
+  // Hooks — the only thing that feeds the island. Parse defensively.
+  const settings = readSettings();
+  if (settings === null) {
+    warn("~/.claude/settings.json — can't parse");
+    info("  → fix the JSON, then re-run install");
+  } else {
+    const wired = Object.keys(HOOK_EVENTS).filter((e) =>
+      (settings.hooks?.[e] || []).some((n) => n.hooks?.some((h) => /island-hook/.test(h.command || "")))
+    );
+    line(wired.length === Object.keys(HOOK_EVENTS).length,
+      `Hooks wired (${wired.length}/${Object.keys(HOOK_EVENTS).length})`,
+      "npx claude-code-island install  (answer Yes to configure hooks)");
+    line(/island-statusline/.test(settings.statusLine?.command || ""),
+      "Statusline wired (usage %)",
+      "optional — only powers the notch usage peek");
+  }
+
+  log();
+  hr();
+  log();
+  info("Paste this output into an issue if something's off:");
+  info("https://github.com/narulakeshav/claudeisland/issues");
+  log();
+}
+
 // ── CLI ─────────────────────────────────────────────────────────────────
 
-const command = process.argv[2];
+function runCLI() {
+  switch (process.argv[2]) {
+    case "install":   install(); break;
+    case "uninstall": uninstall(); break;
+    case "test":      test(); break;
+    case "doctor":    doctor(); break;
+    default:
+      console.log(LOGO);
+      hr();
+      log();
+      log(`${c.white}Usage:${c.reset}`);
+      log();
+      log(`  ${c.orange}install${c.reset}     Set up the notch island`);
+      log(`  ${c.orange}install --no-hooks${c.reset}  Rebuild/relaunch without touching Claude settings`);
+      log(`  ${c.orange}test${c.reset}        Run through the states`);
+      log(`  ${c.orange}doctor${c.reset}      Diagnose a broken install`);
+      log(`  ${c.orange}uninstall${c.reset}   Remove everything`);
+      log();
+      info(`npx claude-code-island install`);
+      log();
+  }
+}
 
-switch (command) {
-  case "install":
-    install();
-    break;
-  case "uninstall":
-    uninstall();
-    break;
-  case "test":
-    test();
-    break;
-  default:
-    console.log(LOGO);
-    hr();
-    log();
-    log(`${c.white}Usage:${c.reset}`);
-    log();
-    log(`  ${c.orange}install${c.reset}     Set up the notch island`);
-    log(`  ${c.orange}install --no-hooks${c.reset}  Rebuild/relaunch without touching Claude settings`);
-    log(`  ${c.orange}test${c.reset}        Run through the states`);
-    log(`  ${c.orange}uninstall${c.reset}   Remove everything`);
-    log();
-    info(`npx claude-code-island install`);
-    log();
+// Run the CLI only when invoked directly; when required (by the tests) just expose the
+// internals so the settings logic can be exercised without the launchctl/swiftc side effects.
+if (require.main === module) {
+  runCLI();
+} else {
+  module.exports = {
+    MINE, HOOK_EVENTS, SETTINGS_PATH,
+    readSettings, writeSettings, configureHooks, stripIslandFromSettings,
+  };
 }

@@ -1,9 +1,9 @@
 {
-  "name": "claude-code-island",
+  "name": "agents-island",
   "version": "0.2.0",
-  "description": "A live-activity island in your Mac's notch for Claude Code — see what every session is doing across all your terminals, and click to jump back to the right tab.",
+  "description": "A live-activity island in your Mac's notch for your coding agents — see what every session is doing across all your terminals, and click to jump back to the right tab.",
   "bin": {
-    "claude-code-island": "bin/cli.js"
+    "agents-island": "bin/cli.js"
   },
   "scripts": {
     "test": "node test/settings.test.js"
@@ -35,11 +35,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/narulakeshav/claudeisland.git"
+    "url": "git+https://github.com/narulakeshav/agents-island.git"
   },
-  "homepage": "https://github.com/narulakeshav/claudeisland#readme",
+  "homepage": "https://github.com/narulakeshav/agents-island#readme",
   "bugs": {
-    "url": "https://github.com/narulakeshav/claudeisland/issues"
+    "url": "https://github.com/narulakeshav/agents-island/issues"
   },
   "author": "Keshav Narula",
   "license": "MIT"

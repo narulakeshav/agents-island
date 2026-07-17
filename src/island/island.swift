@@ -4,18 +4,18 @@ import CoreText
 import CryptoKit
 
 // ─────────────────────────────────────────────────────────────────────────
-// ClaudeIsland — a persistent notch "live activity" for Claude Code.
+// AgentsIsland — a persistent notch "live activity" for Claude Code.
 //
 // Runs as a background LSUIElement agent. Owns a borderless, non-activating
 // NSPanel pinned at the top-center of the notch screen. State is pushed in
 // from Claude Code hooks: the `island-send` helper writes a normalized
-// payload to ~/.claude-island/event.json and posts a Darwin notification,
+// payload to ~/.agents-island/event.json and posts a Darwin notification,
 // which wakes this process to reload and animate.
 // ─────────────────────────────────────────────────────────────────────────
 
 // MARK: - Paths
 
-let kEventDir = NSString("~/.claude-island").expandingTildeInPath
+let kEventDir = NSString("~/.agents-island").expandingTildeInPath
 let kEventFile = kEventDir + "/event.json"
 let kSessionsDir = kEventDir + "/sessions"     // one <tabUUID>.json per live session
 // Claude Code's own per-session state files (one <pid>.json each, keyed by sessionId).
@@ -23,7 +23,7 @@ let kSessionsDir = kEventDir + "/sessions"     // one <tabUUID>.json per live se
 // for whether a session is actually computing right now. Reverse-engineered, no API.
 let kCCSessionsDir = NSString("~/.claude/sessions").expandingTildeInPath
 let kProjectOrderFile = kEventDir + "/project-order"   // persisted dropdown group order (first-seen)
-let kDarwinName = "com.claude-island.event"
+let kDarwinName = "com.agents-island.event"
 
 // EXPERIMENT: lead each dropdown row with the session's opening user prompt instead of
 // the Warp tab name — the prompt is a far stickier "which convo is this" anchor. Flip to
@@ -366,7 +366,7 @@ final class IslandState: ObservableObject {
     // this to slide the card out and reveal its title.
     @Published var hoveredCard: String? = nil
 
-    // ── Alternate "dropdown" UI (config: ~/.claude-island/ui-mode = peek | dropdown) ──
+    // ── Alternate "dropdown" UI (config: ~/.agents-island/ui-mode = peek | dropdown) ──
     // peek    : back cards stack/peek to the LEFT, hover reveals each title.
     // dropdown: a single "{n} ⌄" back pill peeks to the RIGHT; clicking it drops down a
     //           menu listing every tracked session (dot + name), click a row to focus.
@@ -2601,7 +2601,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                                                // for the kCommentaryHoldS protected window
     private var lastFlashPriority: Int = 0     // its priority (2 prose / 1 notable action), so a
                                                // higher-priority item can preempt it mid-hold
-    // DEBUG flicker logger (gated by ~/.claude-island/flicker.on): last log time + on/off cache.
+    // DEBUG flicker logger (gated by ~/.agents-island/flicker.on): last log time + on/off cache.
     private var lastFlickerT: Double = 0
     private var dismissedDoneIds: Set<String> = []  // clicked-away "Finished" pills — excluded
                                                 // from front-selection until they do something new
@@ -2633,7 +2633,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = notchGlyph()
-        item.button?.toolTip = "Claude Island"
+        item.button?.toolTip = "Agents Island"
         let menu = NSMenu()
         let pause = NSMenuItem(title: "Pause", action: #selector(togglePause), keyEquivalent: "")
         pause.target = self
@@ -2646,7 +2646,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         codex.state = showCodex ? .on : .off
         menu.addItem(codex)
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit Claude Island", action: #selector(quitIsland), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit Agents Island", action: #selector(quitIsland), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
         item.menu = menu
@@ -2699,7 +2699,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     @objc private func quitIsland() {
         // KeepAlive=true would relaunch a plain terminate, so bootout the LaunchAgent — it stays
         // quit until next login (or a reinstall / manual `launchctl bootstrap`).
-        _ = shell("/bin/launchctl", ["bootout", "gui/\(getuid())/com.claude-island.app"])
+        _ = shell("/bin/launchctl", ["bootout", "gui/\(getuid())/com.agents-island.app"])
         NSApp.terminate(nil)
     }
 
@@ -4217,7 +4217,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func computeLiveTabs(_ ccInfos: [String: CCSessionInfo]? = nil) -> (cwds: [String: String], sids: [String: String], focuses: [String: String]) {
         // Anchored so "claude" must be a whole path/word component (start/end or flanked by
         // "/" or a space) — a bare substring match would also catch unrelated long-running
-        // processes like a "claudeisland-slack-bot" dev server, permanently pinning whatever
+        // processes like a "agents-island-slack-bot" dev server, permanently pinning whatever
         // terminal tab launched it as "live" and resurrecting its last-known session as a
         // stale card that never ages out.
         let pids = shell("/usr/bin/pgrep", ["-U", "\(getuid())", "-f", "(^|[/ ])claude([/ ]|$)"])
@@ -4773,12 +4773,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         return out.count == 32 ? out : nil
     }
 
-    /// DEBUG: append one line per visible right-slot change to ~/.claude-island/flicker.log —
+    /// DEBUG: append one line per visible right-slot change to ~/.agents-island/flicker.log —
     /// wall-clock time, delta since the previous change, and the new content signature — so the
-    /// flicker cadence can be read off precisely. Inert unless the sentinel ~/.claude-island/
+    /// flicker cadence can be read off precisely. Inert unless the sentinel ~/.agents-island/
     /// flicker.on exists (touch it to enable, rm to disable — no rebuild needed).
     func logFlicker(_ sig: String) {
-        let dir = NSHomeDirectory() + "/.claude-island"
+        let dir = NSHomeDirectory() + "/.agents-island"
         guard FileManager.default.fileExists(atPath: dir + "/flicker.on") else { return }
         let t = CACurrentMediaTime()
         let dt = lastFlickerT == 0 ? 0 : (t - lastFlickerT)
@@ -4796,7 +4796,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// DEBUG: same log file as logFlicker, but for rebuild()'s flash decisions (TRIGGER/
     /// SUPPRESS/RESET) — shows WHY the right slot changed, alongside the visible-change lines.
     func logDecision(_ msg: String) {
-        let dir = NSHomeDirectory() + "/.claude-island"
+        let dir = NSHomeDirectory() + "/.agents-island"
         guard FileManager.default.fileExists(atPath: dir + "/flicker.on") else { return }
         let t = CACurrentMediaTime()
         let dt = lastFlickerT == 0 ? 0 : (t - lastFlickerT)
@@ -5116,7 +5116,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// statusline JSON. Returns ("","") when the file is missing or stale (older than the 5h
     /// window, so a since-reset value isn't shown as current). Each window is independent.
     private func readRateLimits() -> (session: String, week: String, sessionReset: Double, weekReset: Double) {
-        let path = NSString("~/.claude-island/rate-limits.json").expandingTildeInPath
+        let path = NSString("~/.agents-island/rate-limits.json").expandingTildeInPath
         guard let data = FileManager.default.contents(atPath: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return ("", "", 0, 0) }
@@ -5153,7 +5153,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         guard transcript.hasSuffix(".jsonl") else { return nil }
         let sid = String((transcript as NSString).lastPathComponent.dropLast(6))   // ".jsonl"
         guard !sid.isEmpty else { return nil }
-        let path = ("~/.claude-island/ctx/\(sid).json" as NSString).expandingTildeInPath
+        let path = ("~/.agents-island/ctx/\(sid).json" as NSString).expandingTildeInPath
         guard let data = FileManager.default.contents(atPath: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let pct = (obj["pct"] as? NSNumber)?.doubleValue else { return nil }

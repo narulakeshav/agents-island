@@ -8,7 +8,7 @@ const readline = require("readline");
 
 const HOME = process.env.HOME;
 const APP_DIR = path.join(HOME, "Applications");
-const APP_PATH = path.join(APP_DIR, "ClaudeIsland.app");
+const APP_PATH = path.join(APP_DIR, "AgentsIsland.app");
 const MACOS_DIR = path.join(APP_PATH, "Contents", "MacOS");
 const ISLAND_SRC = path.join(__dirname, "..", "src", "island", "island.swift");
 const SEND_SRC = path.join(__dirname, "..", "src", "island", "island-send.swift");
@@ -17,19 +17,29 @@ const STATUSLINE_SRC = path.join(__dirname, "..", "src", "island", "island-statu
 const ASSETS_DIR = path.join(__dirname, "..", "src", "island", "assets");
 const SETTINGS_PATH = path.join(HOME, ".claude", "settings.json");
 const LAUNCH_AGENTS = path.join(HOME, "Library", "LaunchAgents");
-const PLIST_LABEL = "com.claude-island.app";
+const PLIST_LABEL = "com.agents-island.app";
 const PLIST_PATH = path.join(LAUNCH_AGENTS, `${PLIST_LABEL}.plist`);
-const EVENT_DIR = path.join(HOME, ".claude-island");
+const EVENT_DIR = path.join(HOME, ".agents-island");
 const VERSION = require("../package.json").version;
-const LOCAL_CODESIGN_NAME = "Claude Island Local";
+const LOCAL_CODESIGN_NAME = "Agents Island Local";
 
-// Matches hooks owned by this tool or the legacy banner notifier we migrate from. Every
-// alternative here must be a name WE own: anything matching gets stripped from the user's
-// settings on install and deleted on uninstall. (A bare `stop-hook` used to be listed — it
-// would eat an unrelated `~/bin/stop-hook.sh` a user wired up themselves, and matched nothing
-// of ours that `ClaudeNotify` didn't already: the legacy command was always
-// `~/Applications/ClaudeNotify.app/Contents/MacOS/stop-hook.sh`.)
-const MINE = /claude-island|island-hook|ClaudeNotify|ClaudeCodeNotification/;
+// Pre-rename identity (was "Claude Island"). An upgrader has the old app, LaunchAgent, and state
+// dir on disk; install() clears them first so the old daemon can't linger beside the new one.
+const LEGACY = {
+  label: "com.claude-island.app",
+  plist: path.join(LAUNCH_AGENTS, "com.claude-island.app.plist"),
+  app: path.join(APP_DIR, "ClaudeIsland.app"),
+  eventDir: path.join(HOME, ".claude-island"),
+};
+
+// Matches hooks owned by this tool or the ancestors we migrate from. Every alternative must be
+// a name WE own: anything matching gets stripped from the user's settings on install and deleted
+// on uninstall. `island-hook` catches our hook command under any app dir (the script name never
+// changed), so it covers both the old ClaudeIsland and new AgentsIsland installs; `claude-island`
+// stays listed so a pre-rename install migrates cleanly. (A bare `stop-hook` was once here — it
+// would eat an unrelated `~/bin/stop-hook.sh`, and matched nothing `ClaudeNotify` didn't already:
+// the legacy command was always `~/Applications/ClaudeNotify.app/Contents/MacOS/stop-hook.sh`.)
+const MINE = /agents-island|claude-island|island-hook|ClaudeNotify|ClaudeCodeNotification/;
 
 // The hook events we own → the event name each passes to island-hook.py. Install writes
 // exactly these; uninstall removes exactly these. One list, so the two can never drift.
@@ -69,8 +79,8 @@ function center(text, width) {
   return " ".repeat(left) + text + " ".repeat(right);
 }
 
-const titleBar = `─── ${c.reset}${c.bold}${c.white}claude-code-island${c.reset} ${c.dim}v${VERSION} `;
-const titleVis = `─── claude-code-island v${VERSION} `;
+const titleBar = `─── ${c.reset}${c.bold}${c.white}agents-island${c.reset} ${c.dim}v${VERSION} `;
+const titleVis = `─── agents-island v${VERSION} `;
 const titlePad = "─".repeat(Math.max(0, W - titleVis.length));
 
 const LOGO = `
@@ -80,7 +90,7 @@ ${c.dim}│${c.reset}${center(`${c.white}╭─────────╮${c.re
 ${c.dim}│${c.reset}${center(`${c.white}│ ${c.peach}◜◞${c.white}  ···· │${c.reset}`, W)}${c.dim}│${c.reset}
 ${c.dim}│${c.reset}${center(`${c.white}╰─────────╯${c.reset}`, W)}${c.dim}│${c.reset}
 ${c.dim}│${" ".repeat(W)}│${c.reset}
-${c.dim}│${c.reset}${center(`${c.gray}A live activity in your notch for Claude Code${c.reset}`, W)}${c.dim}│${c.reset}
+${c.dim}│${c.reset}${center(`${c.gray}A live activity in your notch for your coding agents${c.reset}`, W)}${c.dim}│${c.reset}
 ${c.dim}│${c.reset}${center(`${c.dim}by Keshav Narula · x.com/narulakeshav${c.reset}`, W)}${c.dim}│${c.reset}
 ${c.dim}╰${"─".repeat(W)}╯${c.reset}
 `;
@@ -119,9 +129,9 @@ function appPlist() {
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.claude-island.app</string>
+    <string>com.agents-island.app</string>
     <key>CFBundleName</key>
-    <string>Claude Island</string>
+    <string>Agents Island</string>
     <key>CFBundleExecutable</key>
     <string>island</string>
     <key>CFBundlePackageType</key>
@@ -129,7 +139,7 @@ function appPlist() {
     <key>LSUIElement</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Claude Island focuses the terminal tab a session is running in when you click it.</string>
+    <string>Agents Island focuses the terminal tab a session is running in when you click it.</string>
 </dict>
 </plist>`;
 }
@@ -166,7 +176,7 @@ function findLocalCodesignIdentity() {
 }
 
 function codesignIdentity() {
-  return process.env.CLAUDE_ISLAND_CODESIGN_IDENTITY || findLocalCodesignIdentity() || "-";
+  return process.env.AGENTS_ISLAND_CODESIGN_IDENTITY || findLocalCodesignIdentity() || "-";
 }
 
 function signApp(appPath) {
@@ -207,8 +217,8 @@ function startAgent() {
 }
 
 function buildStagedApp() {
-  const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-island-build-"));
-  const stagedApp = path.join(stageRoot, "ClaudeIsland.app");
+  const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agents-island-build-"));
+  const stagedApp = path.join(stageRoot, "AgentsIsland.app");
   const stagedMacOS = path.join(stagedApp, "Contents", "MacOS");
 
   fs.mkdirSync(stagedMacOS, { recursive: true });
@@ -231,10 +241,25 @@ function buildStagedApp() {
 
 // ── Install ─────────────────────────────────────────────────────────────
 
+// Remove a pre-rename ("Claude Island") install so it can't run beside the new one. The hooks
+// aren't touched here — configureHooks already replaces old island-hook entries in place (MINE
+// still matches them), so migrating them would double-remove. Best-effort throughout.
+function migrateFromLegacy() {
+  let found = false;
+  const uid = process.getuid();
+  try { execFileSync("/bin/launchctl", ["bootout", `gui/${uid}/${LEGACY.label}`], { stdio: "pipe" }); found = true; } catch {}
+  for (const p of [LEGACY.plist, LEGACY.app, LEGACY.eventDir]) {
+    if (fs.existsSync(p)) { try { fs.rmSync(p, { recursive: true, force: true }); found = true; } catch {} }
+  }
+  if (found) done("Removed the old Claude Island install");
+}
+
 async function install() {
   console.log(LOGO);
   hr();
   log();
+
+  migrateFromLegacy();
 
   // Step 1: Build
   log(`${c.dim}Step 1 of 3${c.reset}  ${c.white}Build${c.reset}`);
@@ -257,7 +282,7 @@ async function install() {
   if (staged.signedWith === "-") {
     done("Signed (ad-hoc)");
     warn("Ad-hoc signing can make macOS ask for permissions again after each rebuild");
-    info(`Create a local Code Signing identity named "${LOCAL_CODESIGN_NAME}" or set CLAUDE_ISLAND_CODESIGN_IDENTITY to keep permissions stable.`);
+    info(`Create a local Code Signing identity named "${LOCAL_CODESIGN_NAME}" or set AGENTS_ISLAND_CODESIGN_IDENTITY to keep permissions stable.`);
   } else {
     done(`Signed (${staged.signedWith})`);
   }
@@ -286,7 +311,7 @@ async function install() {
   // Swap the app only after the staged build is known-good. This keeps the old island
   // running until the last possible moment, and keeps compile failures from unloading it.
   const backupPath = fs.existsSync(APP_PATH)
-    ? path.join(APP_DIR, `.ClaudeIsland.previous-${Date.now()}.app`)
+    ? path.join(APP_DIR, `.AgentsIsland.previous-${Date.now()}.app`)
     : "";
   const swap = spinner("Installing staged app...\n");
   try {
@@ -367,7 +392,7 @@ async function install() {
   }
   console.log(`  ${c.orange}◆${c.reset} ${c.bold}${c.white}You're all set!${c.reset}`);
   log();
-  info(`Test it: ${c.white}npx claude-code-island test${c.reset}`);
+  info(`Test it: ${c.white}npx agents-island test${c.reset}`);
   log();
   info(`${c.dim}The pill shows a live spinner while Claude works, expands${c.reset}`);
   info(`${c.dim}when it needs you, and collapses to ✓ when it's done.${c.reset}`);
@@ -434,11 +459,11 @@ function configureHooks(hookDest, statuslineDest) {
   if (!settings.hooks) settings.hooks = {};
 
   // Statusline feed: the ONLY supported source for the live plan rate-limit % (5h / 7d), captured
-  // to ~/.claude-island/ for the notch peek. Only claim the statusLine slot if it's empty or
+  // to ~/.agents-island/ for the notch peek. Only claim the statusLine slot if it's empty or
   // already ours — never clobber a status line the user wrote themselves.
   if (statuslineDest) {
     const cur = settings.statusLine?.command || "";
-    const ours = /island-statusline|ClaudeIsland/.test(cur);
+    const ours = /island-statusline|AgentsIsland/.test(cur);
     if (!settings.statusLine || ours) {
       settings.statusLine = { type: "command", command: `"${statuslineDest}"`, padding: 0 };
     }
@@ -449,7 +474,7 @@ function configureHooks(hookDest, statuslineDest) {
     hooks: [{ type: "command", command: `"${hookDest}" ${event}` }],
   });
 
-  // Replace prior claude-island hooks and migrate off the old banner-based
+  // Replace prior agents-island hooks and migrate off the old banner-based
   // notifier (ClaudeNotify/ClaudeCodeNotification), preserving everything else.
   const strip = (arr) =>
     (arr || []).filter(
@@ -495,7 +520,7 @@ function stripIslandFromSettings(settings) {
     removed = true;
   }
   if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
-  if (/island-statusline|ClaudeIsland/.test(settings.statusLine?.command || "")) {
+  if (/island-statusline|AgentsIsland/.test(settings.statusLine?.command || "")) {
     delete settings.statusLine;
     removed = true;
   }
@@ -515,11 +540,11 @@ function uninstall() {
 
   if (fs.existsSync(APP_PATH)) {
     fs.rmSync(APP_PATH, { recursive: true });
-    done("Removed ~/Applications/ClaudeIsland.app");
+    done("Removed ~/Applications/AgentsIsland.app");
   }
   if (fs.existsSync(EVENT_DIR)) {
     fs.rmSync(EVENT_DIR, { recursive: true });
-    done("Removed ~/.claude-island");
+    done("Removed ~/.agents-island");
   }
 
   // Everything above is ours to delete outright. settings.json isn't — so if it won't parse,
@@ -533,7 +558,7 @@ function uninstall() {
   }
 
   log();
-  console.log(`  ${c.orange}◆${c.reset} ${c.bold}${c.white}Uninstalled.${c.reset} ${c.dim}Thanks for trying claude-code-island!${c.reset}`);
+  console.log(`  ${c.orange}◆${c.reset} ${c.bold}${c.white}Uninstalled.${c.reset} ${c.dim}Thanks for trying agents-island!${c.reset}`);
   log();
 }
 
@@ -542,11 +567,11 @@ function uninstall() {
 async function test() {
   const send = path.join(MACOS_DIR, "island-send");
   if (!fs.existsSync(send)) {
-    warn(`Not installed. Run: ${c.white}npx claude-code-island install${c.reset}`);
+    warn(`Not installed. Run: ${c.white}npx agents-island install${c.reset}`);
     process.exit(1);
   }
 
-  // The daemon only ever reloads from ~/.claude-island/sessions/<id>.json (one file per live
+  // The daemon only ever reloads from ~/.agents-island/sessions/<id>.json (one file per live
   // session) — it never reads the legacy bare event.json that island-send defaults to. Target
   // "sessions/local.json" explicitly so this actually reaches IslandState. "local" is also the
   // one id that's always visible regardless of live-tab tracking (see `visibleSessions`).
@@ -610,10 +635,10 @@ function doctor() {
   line(has("python3"), "python3 (runs the hook)", "comes with Xcode Command Line Tools");
 
   // The app + background agent.
-  line(fs.existsSync(path.join(MACOS_DIR, "island")), "App compiled", "npx claude-code-island install");
-  line(fs.existsSync(PLIST_PATH), "LaunchAgent installed", "npx claude-code-island install");
-  line(running(), "Daemon running", "npx claude-code-island install, or check Console.app for com.claude-island");
-  line(fs.existsSync(EVENT_DIR), "State dir ~/.claude-island", "npx claude-code-island install");
+  line(fs.existsSync(path.join(MACOS_DIR, "island")), "App compiled", "npx agents-island install");
+  line(fs.existsSync(PLIST_PATH), "LaunchAgent installed", "npx agents-island install");
+  line(running(), "Daemon running", "npx agents-island install, or check Console.app for com.agents-island");
+  line(fs.existsSync(EVENT_DIR), "State dir ~/.agents-island", "npx agents-island install");
 
   // Hooks — the only thing that feeds the island. Parse defensively.
   const settings = readSettings();
@@ -626,7 +651,7 @@ function doctor() {
     );
     line(wired.length === Object.keys(HOOK_EVENTS).length,
       `Hooks wired (${wired.length}/${Object.keys(HOOK_EVENTS).length})`,
-      "npx claude-code-island install  (answer Yes to configure hooks)");
+      "npx agents-island install  (answer Yes to configure hooks)");
     line(/island-statusline/.test(settings.statusLine?.command || ""),
       "Statusline wired (usage %)",
       "optional — only powers the notch usage peek");
@@ -636,7 +661,7 @@ function doctor() {
   hr();
   log();
   info("Paste this output into an issue if something's off:");
-  info("https://github.com/narulakeshav/claudeisland/issues");
+  info("https://github.com/narulakeshav/agents-island/issues");
   log();
 }
 
@@ -660,7 +685,7 @@ function runCLI() {
       log(`  ${c.orange}doctor${c.reset}      Diagnose a broken install`);
       log(`  ${c.orange}uninstall${c.reset}   Remove everything`);
       log();
-      info(`npx claude-code-island install`);
+      info(`npx agents-island install`);
       log();
   }
 }

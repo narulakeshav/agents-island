@@ -18,7 +18,7 @@ import hashlib, json, os, re, sys, subprocess, time, random
 EVENT = sys.argv[1] if len(sys.argv) > 1 else ""
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEND = os.path.join(HERE, "island-send")
-ISLAND_DIR = os.environ.get("ISLAND_DIR_OVERRIDE") or os.path.expanduser("~/.claude-island")
+ISLAND_DIR = os.environ.get("ISLAND_DIR_OVERRIDE") or os.path.expanduser("~/.agents-island")
 
 TAIL_BYTES = 262_144   # 256KB transcript tail — covers titles, latest usage, previews, errors
 HEAD_BYTES = 65_536    # 64KB head — the opening prompt lives near the very top

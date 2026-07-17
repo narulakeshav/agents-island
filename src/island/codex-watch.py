@@ -65,7 +65,7 @@ CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 # own generated titles (far better than scraping the first prompt) and the settled preview. The
 # filename carries a schema version, so match the newest state_*.sqlite rather than pinning one.
 CODEX_STATE_GLOB = os.path.join(HOME, ".codex", "state_*.sqlite")
-ISLAND_DIR = os.path.join(HOME, ".claude-island")
+ISLAND_DIR = os.path.join(HOME, ".agents-island")
 HERE = os.path.dirname(os.path.abspath(__file__))
 # island-send lives next to us inside the app bundle; fall back to the installed app so this
 # script also works when run straight out of a source checkout.

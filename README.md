@@ -1,6 +1,6 @@
 # Agents Island
 
-A live-activity **island in your Mac's notch** for your coding agents. See what every session is doing — across all your terminals — and jump back to the exact tab with one click. Today it's wired for [Claude Code](https://docs.anthropic.com/en/docs/claude-code); the surface itself is agent-agnostic.
+A live-activity **island in your Mac's notch** for your coding agents. See what every session is doing — across all your terminals — and jump back to the exact tab with one click. Wired for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://developers.openai.com/codex) out of the box; the surface itself is agent-agnostic.
 
 ```bash
 npx agents-island install
@@ -80,7 +80,7 @@ npx agents-island uninstall   # remove the app, hook, and config
 
 Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) fire on each turn. `agents-island` installs a small hook that, on every event, extracts the session's state from the transcript and writes it to `~/.agents-island/sessions/<tab>.json`. A lightweight native menu-bar daemon watches that folder and renders the notch pill.
 
-Because the daemon just renders those session files, the Claude-specific part is only the hook — the surface itself is agent-agnostic by design.
+Because the daemon just renders those session files, the agent-specific part is only what writes them. **Codex** has no hooks, so instead the daemon tails your `~/.codex` session logs and writes the same files — Codex Desktop chats show up as their own cards (with a `codex://` deep link back to the exact conversation). Toggle them on or off from the menu-bar icon's **Show Codex** item.
 
 ## Requirements
 

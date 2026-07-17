@@ -226,11 +226,14 @@ func ringVisible(_ card: SessionCard) -> Bool {
     card.context >= 0.25
 }
 
-/// Context badge fill — warns as the window fills: white < 30%, amber 30–50%, red ≥ 50%.
+/// Context badge fill — warns as the window fills: quiet translucent-white < 30%, amber 30–50%,
+/// red ≥ 50%. The low band is a LOW-OPACITY white (not solid): a solid white chip glares in the
+/// notch and, worse, hides its own white ring + white "% context" text (white-on-white). A faint
+/// white wash over the dark panel keeps that white content legible while reading as a calm chip.
 func contextFillColor(_ pct: Double) -> Color {
     if pct >= 0.5 { return Color(red: 0.898, green: 0.282, blue: 0.302) }  // red
     if pct > 0.30 { return Color(red: 1.0, green: 0.745, blue: 0.0) }      // amber
-    return .white
+    return Color.white.opacity(0.15)
 }
 
 /// Context badge foreground (ring + percent text) — the amber fill is too light for white

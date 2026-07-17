@@ -1,14 +1,14 @@
-# claude-code-island
+# Agents Island
 
-A live-activity **island in your Mac's notch** for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). See what every session is doing — across all your terminals — and jump back to the exact tab with one click.
+A live-activity **island in your Mac's notch** for your coding agents. See what every session is doing — across all your terminals — and jump back to the exact tab with one click. Today it's wired for [Claude Code](https://docs.anthropic.com/en/docs/claude-code); the surface itself is agent-agnostic.
 
 ```bash
-npx claude-code-island install
+npx agents-island install
 ```
 
 > Requires a Mac with a notch (macOS 13+) and Xcode Command Line Tools (`xcode-select --install`).
 
-![claude-code-island in the notch](assets/dropdown-context-ring-with-git.png)
+![agents-island in the notch](assets/dropdown-context-ring-with-git.png)
 
 ## Every session at a glance
 
@@ -65,20 +65,20 @@ Detection and app-icon tagging work everywhere; click-to-focus fidelity depends 
 ## Commands
 
 ```bash
-npx claude-code-island install     # compile, install, wire up the Claude Code hook
-npx claude-code-island test        # cycle through the states so you can see it
-npx claude-code-island doctor      # check your install if something looks off
-npx claude-code-island uninstall   # remove the app, hook, and config
+npx agents-island install     # compile, install, wire up the Claude Code hook
+npx agents-island test        # cycle through the states so you can see it
+npx agents-island doctor      # check your install if something looks off
+npx agents-island uninstall   # remove the app, hook, and config
 ```
 
 > **First click:** the notch works with no special permissions. The first time you
-> *click* a session to jump to its tab, macOS asks to let Claude Island control that
+> *click* a session to jump to its tab, macOS asks to let Agents Island control that
 > terminal — click **OK**. Denied it by accident? Re-enable under System Settings →
 > Privacy & Security → Automation.
 
 ## How it works
 
-Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) fire on each turn. `claude-code-island` installs a small hook that, on every event, extracts the session's state from the transcript and writes it to `~/.claude-island/sessions/<tab>.json`. A lightweight native menu-bar daemon watches that folder and renders the notch pill.
+Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) fire on each turn. `agents-island` installs a small hook that, on every event, extracts the session's state from the transcript and writes it to `~/.agents-island/sessions/<tab>.json`. A lightweight native menu-bar daemon watches that folder and renders the notch pill.
 
 Because the daemon just renders those session files, the Claude-specific part is only the hook — the surface itself is agent-agnostic by design.
 
@@ -95,7 +95,7 @@ Because the daemon just renders those session files, the Claude-specific part is
 ## Uninstall
 
 ```bash
-npx claude-code-island uninstall
+npx agents-island uninstall
 ```
 
 Removes the app bundle, the LaunchAgent, and the hook from `~/.claude/settings.json`.

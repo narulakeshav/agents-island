@@ -2,14 +2,14 @@ import Foundation
 
 // ─────────────────────────────────────────────────────────────────────────
 // island-send — reads a normalized JSON payload on stdin, writes it atomically
-// to ~/.claude-island/event.json, then posts a Darwin notification to wake the
-// running ClaudeIsland daemon. Fire-and-forget, exits immediately.
+// to ~/.agents-island/event.json, then posts a Darwin notification to wake the
+// running AgentsIsland daemon. Fire-and-forget, exits immediately.
 //
 //   echo '{"mode":"working","title":"Claude Code","detail":"Working…"}' | island-send
 // ─────────────────────────────────────────────────────────────────────────
 
-let dir = NSString("~/.claude-island").expandingTildeInPath
-let darwinName = "com.claude-island.event"
+let dir = NSString("~/.agents-island").expandingTildeInPath
+let darwinName = "com.agents-island.event"
 
 // Optional output path (arg 1), relative to the island dir or absolute.
 // Defaults to event.json for backward compatibility.
@@ -19,7 +19,7 @@ let file = outArg.hasPrefix("/") ? outArg : dir + "/" + outArg
 let data = FileHandle.standardInput.readDataToEndOfFile()
 guard !data.isEmpty else { exit(0) }
 
-// Ensure the parent directory exists (e.g. ~/.claude-island/sessions).
+// Ensure the parent directory exists (e.g. ~/.agents-island/sessions).
 try? FileManager.default.createDirectory(
     atPath: (file as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
 

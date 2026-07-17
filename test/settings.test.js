@@ -17,8 +17,8 @@ fs.mkdirSync(CLAUDE, { recursive: true });
 const S = path.join(CLAUDE, "settings.json");
 
 const cli = require("../bin/cli.js");
-const HOOK = "/Users/x/Applications/ClaudeIsland.app/Contents/MacOS/island-hook.py";
-const STATUS = "/Users/x/Applications/ClaudeIsland.app/Contents/MacOS/island-statusline.py";
+const HOOK = "/Users/x/Applications/AgentsIsland.app/Contents/MacOS/island-hook.py";
+const STATUS = "/Users/x/Applications/AgentsIsland.app/Contents/MacOS/island-statusline.py";
 
 const read = () => JSON.parse(fs.readFileSync(S, "utf8"));
 const writeSettings = (o) => fs.writeFileSync(S, JSON.stringify(o, null, 2));

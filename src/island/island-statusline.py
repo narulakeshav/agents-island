@@ -7,7 +7,7 @@ with the REAL 5-hour and 7-day plan-limit percentages + reset times). None of th
 critical path and none of it reaches hooks, so a tiny statusline command is the only supported
 way to get the live rate-limit %.
 
-This captures `rate_limits` (and `context_window`) to ~/.claude-island/rate-limits.json for the
+This captures `rate_limits` (and `context_window`) to ~/.agents-island/rate-limits.json for the
 daemon to read, then prints NOTHING — the status bar stays invisible (pure data capture). If you
 want a visible Claude Code status line too, print your own line at the end of main().
 
@@ -18,7 +18,7 @@ Stdin schema (the bits we use):
 """
 import json, os, sys, time
 
-ISLAND_DIR = os.environ.get("ISLAND_DIR_OVERRIDE") or os.path.expanduser("~/.claude-island")
+ISLAND_DIR = os.environ.get("ISLAND_DIR_OVERRIDE") or os.path.expanduser("~/.agents-island")
 OUT = os.path.join(ISLAND_DIR, "rate-limits.json")
 CTX_DIR = os.path.join(ISLAND_DIR, "ctx")   # per-session context fill, keyed by CC session_id
 

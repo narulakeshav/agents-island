@@ -1,4 +1,4 @@
-# ClaudeIsland — Architecture & Hard-Won Notes
+# AgentsIsland — Architecture & Hard-Won Notes
 
 A notch "Dynamic Island"–style live activity for Claude Code (CC) on macOS. Shows
 what each CC session is doing in a pill around the MacBook notch, with the other
@@ -11,14 +11,14 @@ syncing model, and — most important — the **non-obvious quirks** that cost h
 ## 1. The three processes
 
 ```
-Claude Code hooks ──> island-hook.py ──> island-send ──> ~/.claude-island/sessions/<tab>.json
+Claude Code hooks ──> island-hook.py ──> island-send ──> ~/.agents-island/sessions/<tab>.json
                                                               │  (+ Darwin notification)
                                                               ▼
                                                        island (daemon)  ──> NSPanel at the notch
 ```
 
 - **`island.swift`** — the daemon. A persistent `LSUIElement` background agent
-  (LaunchAgent `com.claude-island.app`, KeepAlive). Owns a borderless,
+  (LaunchAgent `com.agents-island.app`, KeepAlive). Owns a borderless,
   non-activating `NSPanel` pinned top-center of the notch screen, rendering a
   SwiftUI `IslandView`. Woken by a Darwin notification; also polls on a 4s timer.
 - **`island-hook.py`** — invoked by CC hooks. Reads the hook JSON on stdin,
@@ -26,19 +26,19 @@ Claude Code hooks ──> island-hook.py ──> island-send ──> ~/.claude-i
   (Replaced an earlier `island-hook.sh`, which spawned ~8-10 `python3 -c` processes
   per event; the rewrite is one process. The bash version is gone as of v0.2.0.)
 - **`island-send.swift`** — tiny helper: reads JSON on stdin, atomically writes it
-  to the path given as `argv[1]` (relative to `~/.claude-island`, default
-  `event.json`), then posts the Darwin notification `com.claude-island.event`.
+  to the path given as `argv[1]` (relative to `~/.agents-island`, default
+  `event.json`), then posts the Darwin notification `com.agents-island.event`.
 - **`bin/cli.js`** — installer: compiles the two binaries into
-  `~/Applications/ClaudeIsland.app`, installs the LaunchAgent, wires the hooks
+  `~/Applications/AgentsIsland.app`, installs the LaunchAgent, wires the hooks
   into `~/.claude/settings.json` (global, so all projects get them).
 
 ### IPC
 - **Darwin notifications** (`CFNotificationCenterGetDarwinNotifyCenter`) — a
   content-less "something changed" ping. The daemon re-reads files on receipt.
-- **Files** in `~/.claude-island/` — the actual state. `sessions/<tabUUID>.json`
+- **Files** in `~/.agents-island/` — the actual state. `sessions/<tabUUID>.json`
   is one file per live session (the source of truth). Atomic writes only.
 
-### Paths (`~/.claude-island/`)
+### Paths (`~/.agents-island/`)
 - `sessions/<tabUUID>.json` — per-session state (the multi-session model).
 - `event.json` — legacy single-session file; still the `island-send` default but
   the daemon no longer reads it.
@@ -183,7 +183,7 @@ removes the session + deletes its file. (File IO; runs on the background queue.)
 - Context fill = `(input_tokens + cache_read_input_tokens + cache_creation_input_tokens)`
   from the latest assistant `usage`, over the window. **The transcript strips the
   model's `[1m]` suffix**, so you can't read the 1M window from the model id —
-  honor `~/.claude-island/context-window` (an integer), else infer 1M once usage
+  honor `~/.agents-island/context-window` (an integer), else infer 1M once usage
   exceeds 200k. (Set to `1000000` for the 1M-context machine.)
 
 **Hooks**
@@ -240,13 +240,13 @@ removes the session + deletes its file. (File IO; runs on the background queue.)
 ## 6. Build / deploy / test
 
 ```bash
-APP="$HOME/Applications/ClaudeIsland.app/Contents/MacOS"
+APP="$HOME/Applications/AgentsIsland.app/Contents/MacOS"
 SRC=".../src/island"
 swiftc -O -o "$APP/island"      "$SRC/island.swift"      -framework Cocoa -framework SwiftUI
 swiftc -O -o "$APP/island-send" "$SRC/island-send.swift" -framework Foundation
 cp "$SRC/island-hook.py" "$APP/island-hook.py"; chmod +x "$APP/island-hook.py"
-codesign --force --deep --sign - "$HOME/Applications/ClaudeIsland.app"
-launchctl kickstart -k "gui/$(id -u)/com.claude-island.app"   # restart daemon
+codesign --force --deep --sign - "$HOME/Applications/AgentsIsland.app"
+launchctl kickstart -k "gui/$(id -u)/com.agents-island.app"   # restart daemon
 ```
 
 Drive a fake session for testing (bypasses the live pipeline). Use `id:"local"`
